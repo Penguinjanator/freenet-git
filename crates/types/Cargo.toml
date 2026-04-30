@@ -1,0 +1,32 @@
+[package]
+name = "freenet-git-types"
+description = "Shared state types and pure validate_state/update_state logic for freenet-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+freenet-git-encoding = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+# We do NOT pull in ed25519-dalek directly inside the contract WASM because the
+# default `rand_core` features hit the `getrandom` js shim under wasm32. The
+# contract only verifies signatures, so we use `ed25519-compact` instead which
+# has zero rand dependencies. The CLI side links against ed25519-dalek through
+# this crate via the `signing` feature.
+ed25519-compact = { workspace = true }
+ed25519-dalek = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables RepoState::sign_* helpers that need a full ed25519 signing key.
+# Disabled in WASM contract builds where only verification is needed.
+signing = ["dep:ed25519-dalek"]

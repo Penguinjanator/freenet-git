@@ -1,0 +1,12 @@
+[toolchain]
+# Pinned to keep contract WASM builds deterministic.
+#
+# Why this matters: a contract's key is BLAKE3(BLAKE3(wasm) || params). A
+# different rustc version produces different WASM bytes and therefore a
+# different contract key, which is treated as a different repo by the network.
+# Pinning the toolchain is part of the schema-stability contract: bumping it
+# is a breaking change that requires the same migration ritual as any other
+# schema bump (see freenet/river's `legacy_delegates.toml` system for prior art).
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
