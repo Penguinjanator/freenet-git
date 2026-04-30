@@ -7,7 +7,6 @@ members = [
     "crates/pack-contract",
     "crates/repo-contract",
     "crates/freenet-git",
-    "crates/git-remote-freenet",
 ]
 
 [workspace.package]
@@ -58,11 +57,11 @@ rpassword = "7"
 # Freenet
 freenet-stdlib = { version = "0.6.0" }
 
-# Internal
+# Internal — keep both `path` and `version`. Path is used during local
+# development (workspace builds); version is required for crates.io.
 freenet-git-encoding = { path = "crates/encoding", version = "0.1.0" }
 freenet-git-types = { path = "crates/types", version = "0.1.0" }
 freenet-git-identity = { path = "crates/identity", version = "0.1.0" }
-freenet-git-client = { path = "crates/client", version = "0.1.0" }
 
 # Test utilities
 hex = "0.4"

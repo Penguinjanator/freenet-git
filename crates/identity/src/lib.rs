@@ -167,15 +167,40 @@ impl KdfParams {
 }
 
 /// One row in the per-repo registry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Each repo carries its own ed25519 keypair, mirroring the delta site
+/// model: the URL prefix is derived from the per-repo public key, so a
+/// fresh repo means a fresh keypair. The bundle's "default" identity
+/// (`secret_key` / `public_key` at the top level) is reserved for
+/// future per-user signing — PR comments and reviews in Phase 2.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoRegistryEntry {
-    /// 16-byte random nonce we used in `RepoParams.repo_nonce`.
+    /// ed25519 secret key for THIS repo.
     #[serde(with = "serde_bytes")]
-    pub repo_nonce: Vec<u8>,
-    /// Last URL we saw for this repo (typed as `freenet:<base58 contract key>`).
-    pub last_known_url: String,
-    /// Friendly name for `freenet-git subscriptions` listing.
+    pub repo_secret: Vec<u8>,
+    /// ed25519 public key for THIS repo.
+    #[serde(with = "serde_bytes")]
+    pub repo_public: Vec<u8>,
+    /// The base58 prefix derived from `repo_public`. This IS the URL
+    /// (modulo the `freenet:` scheme and an optional label). Cached
+    /// here so we don't recompute on every CLI invocation.
+    pub prefix: String,
+    /// Display name (typically the repo name; used as the URL label).
     pub display_name: String,
+}
+
+impl std::fmt::Debug for RepoRegistryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepoRegistryEntry")
+            .field("prefix", &self.prefix)
+            .field("display_name", &self.display_name)
+            .field("repo_secret", &"<redacted>")
+            .field(
+                "repo_public",
+                &format_args!("{}", hex_short(&self.repo_public)),
+            )
+            .finish()
+    }
 }
 
 /// Decrypted bundle contents. Held in memory for the duration of one CLI

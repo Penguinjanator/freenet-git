@@ -59,9 +59,13 @@ fn run() -> Result<()> {
     let _remote_name = &args[0];
     let url_str = &args[1];
 
-    let contract_id = url::parse(url_str).with_context(|| format!("parse remote URL {url_str}"))?;
+    let parsed = url::parse(url_str).with_context(|| format!("parse remote URL {url_str}"))?;
 
-    let env = HelperEnv::from_env(contract_id)?;
+    // Compute the contract instance id from the parsed prefix and the
+    // bundled (or override) repo-contract WASM. This is delta-style
+    // permissionless addressing: anyone with the URL plus the WASM
+    // resolves the same key.
+    let env = HelperEnv::from_env(parsed)?;
 
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
@@ -147,7 +151,34 @@ fn split_fetch(args: &str) -> Result<(String, String)> {
     Ok((sha.to_string(), name.to_string()))
 }
 
+/// Read the repo-contract WASM. Defaults to the bytes bundled into this
+/// binary by `freenet_git_cli::REPO_CONTRACT_WASM`; honors
+/// `FREENET_GIT_REPO_WASM` for source-tree iteration.
+fn load_repo_wasm(env: &HelperEnv) -> Result<Vec<u8>> {
+    match env.repo_wasm_path.as_ref() {
+        Some(path) => std::fs::read(path)
+            .with_context(|| format!("read repo-contract wasm from {}", path.display())),
+        None => Ok(freenet_git_cli::REPO_CONTRACT_WASM.to_vec()),
+    }
+}
+
+/// Read the pack-contract WASM. Defaults to the bytes bundled into this
+/// binary by `freenet_git_cli::PACK_CONTRACT_WASM`; honors
+/// `FREENET_GIT_PACK_WASM` for source-tree iteration.
+fn load_pack_wasm(env: &HelperEnv) -> Result<Vec<u8>> {
+    match env.pack_wasm_path.as_ref() {
+        Some(path) => std::fs::read(path)
+            .with_context(|| format!("read pack-contract wasm from {}", path.display())),
+        None => Ok(freenet_git_cli::PACK_CONTRACT_WASM.to_vec()),
+    }
+}
+
 struct HelperEnv {
+    /// URL prefix (the canonical identifier). Used as the lookup key in
+    /// the bundle's per-repo registry.
+    prefix: String,
+    /// Contract instance id derived from the prefix + the bundled
+    /// (or `--repo-wasm`-overridden) repo-contract WASM.
     contract_id: ContractInstanceId,
     ws_url: String,
     git_dir: PathBuf,
@@ -157,7 +188,7 @@ struct HelperEnv {
 }
 
 impl HelperEnv {
-    fn from_env(contract_id: ContractInstanceId) -> Result<Self> {
+    fn from_env(parsed: url::ParsedUrl) -> Result<Self> {
         let ws_url =
             std::env::var("FREENET_GIT_WS_URL").unwrap_or_else(|_| DEFAULT_WS_URL.to_string());
         let git_dir = PathBuf::from(std::env::var("GIT_DIR").unwrap_or_else(|_| ".git".into()));
@@ -170,7 +201,19 @@ impl HelperEnv {
         let pack_wasm_path = std::env::var("FREENET_GIT_PACK_WASM")
             .ok()
             .map(PathBuf::from);
+
+        // Derive the contract instance id from the URL prefix and the
+        // chosen repo-contract WASM bytes (env override or bundled).
+        let repo_wasm: Vec<u8> = match repo_wasm_path.as_ref() {
+            Some(path) => std::fs::read(path)
+                .with_context(|| format!("read repo-contract wasm from {}", path.display()))?,
+            None => freenet_git_cli::REPO_CONTRACT_WASM.to_vec(),
+        };
+        let contract_id =
+            freenet_git_cli::ids::repo_contract_id_from_prefix(&repo_wasm, &parsed.prefix);
+
         Ok(Self {
+            prefix: parsed.prefix,
             contract_id,
             ws_url,
             git_dir,
@@ -204,12 +247,7 @@ fn handle_list<W: Write>(env: &HelperEnv, out: &mut W) -> Result<()> {
 }
 
 fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut W) -> Result<()> {
-    let pack_wasm_path = env
-        .pack_wasm_path
-        .as_ref()
-        .ok_or_else(|| anyhow!("FREENET_GIT_PACK_WASM not set — required to GET pack contracts"))?;
-    let pack_wasm = std::fs::read(pack_wasm_path)
-        .with_context(|| format!("read pack-contract wasm from {}", pack_wasm_path.display()))?;
+    let pack_wasm = load_pack_wasm(env)?;
 
     let runtime = build_runtime()?;
     runtime.block_on(async {
@@ -224,7 +262,7 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         // (just suboptimal).
         let mut single_packs: Vec<[u8; 32]> = Vec::new();
         let mut chunked_skipped = 0usize;
-        for (_id, record) in &state.object_index {
+        for record in state.object_index.values() {
             match &record.bundle {
                 ObjectBundle::SinglePack { pack_hash, .. } => single_packs.push(*pack_hash),
                 ObjectBundle::ChunkedPack { .. } => chunked_skipped += 1,
@@ -293,16 +331,8 @@ fn install_pack(git_dir: &std::path::Path, pack_bytes: &[u8]) -> Result<()> {
 }
 
 fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Result<()> {
-    let repo_wasm_path = env.repo_wasm_path.as_ref().ok_or_else(|| {
-        anyhow!("FREENET_GIT_REPO_WASM not set — required for sign-domain key + UPDATE")
-    })?;
-    let pack_wasm_path = env.pack_wasm_path.as_ref().ok_or_else(|| {
-        anyhow!("FREENET_GIT_PACK_WASM not set — required to PUT new pack contracts")
-    })?;
-    let _repo_wasm = std::fs::read(repo_wasm_path)
-        .with_context(|| format!("read repo-contract wasm from {}", repo_wasm_path.display()))?;
-    let pack_wasm = std::fs::read(pack_wasm_path)
-        .with_context(|| format!("read pack-contract wasm from {}", pack_wasm_path.display()))?;
+    let _repo_wasm = load_repo_wasm(env)?;
+    let pack_wasm = load_pack_wasm(env)?;
 
     // Decrypt identity once (asks for the passphrase via FREENET_GIT_PASSPHRASE
     // or, in interactive use, via a separate `freenet-git` invocation; we
@@ -315,7 +345,34 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
     })?;
     let bundle = read_bundle(&env.identity_path, &pw)
         .with_context(|| format!("decrypt identity bundle at {}", env.identity_path.display()))?;
-    let signing = bundle.signing_key()?;
+
+    // Find the per-repo signing key in the bundle by matching the URL
+    // prefix. Each repo has its own keypair (delta-style); we never
+    // reuse the bundle's "default" identity here.
+    let registry_entry = bundle
+        .repos
+        .iter()
+        .find(|r| r.prefix == env.prefix)
+        .ok_or_else(|| {
+            anyhow!(
+                "no entry for prefix {} in identity bundle registry — was this \
+                 repo created with this identity?",
+                env.prefix,
+            )
+        })?;
+    let signing = {
+        let bytes: [u8; 32] = registry_entry
+            .repo_secret
+            .as_slice()
+            .try_into()
+            .map_err(|_| {
+                anyhow!(
+                    "registry repo_secret is wrong length for prefix {}",
+                    env.prefix
+                )
+            })?;
+        ed25519_dalek::SigningKey::from_bytes(&bytes)
+    };
 
     let runtime = build_runtime()?;
     let result = runtime.block_on(async {
@@ -324,29 +381,8 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         let state_bytes = wsclient::get_state(&mut api, env.contract_id, false, WS_TIMEOUT).await?;
         let state = RepoState::from_bytes(&state_bytes)?;
 
-        // Recover RepoParams by reading the state's owner from the
-        // bundle (the public key) and the repo_nonce from the bundle's
-        // registry. We expect the URL the user is pushing to to be
-        // present in the registry; if not, we fall back to scanning.
-        let repo_url = url::format(&env.contract_id);
-        let registry_entry = bundle
-            .repos
-            .iter()
-            .find(|r| r.last_known_url == repo_url)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no entry for {repo_url} in identity bundle registry — was this \
-                     repo created with this identity?",
-                )
-            })?;
-        let repo_nonce: [u8; 16] = registry_entry
-            .repo_nonce
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("registry repo_nonce is wrong length"))?;
         let params = freenet_git_types::RepoParams {
-            owner: signing.verifying_key().to_bytes(),
-            repo_nonce,
+            prefix: env.prefix.clone(),
         };
 
         let mut delta = RepoState::default();

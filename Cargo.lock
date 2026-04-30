@@ -701,6 +701,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "bs58",
  "ed25519-compact",
  "ed25519-dalek",
  "freenet-git-encoding",
@@ -882,27 +883,6 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
-]
-
-[[package]]
-name = "git-remote-freenet"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "blake3",
- "ed25519-dalek",
- "freenet-git",
- "freenet-git-encoding",
- "freenet-git-identity",
- "freenet-git-types",
- "freenet-stdlib",
- "hex",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

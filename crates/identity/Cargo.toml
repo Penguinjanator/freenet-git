@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+keywords = ["freenet", "git", "identity", "ed25519", "encrypted"]
+categories = ["cryptography", "authentication"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }

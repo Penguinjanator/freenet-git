@@ -31,12 +31,11 @@ fn fixed_key(seed: u8) -> SigningKey {
 }
 
 fn build_owner_state(owner: &SigningKey) -> (RepoParams, RepoState) {
-    let params = RepoParams {
-        owner: owner.verifying_key().to_bytes(),
-        repo_nonce: [7u8; 16],
-    };
+    let owner_pub = owner.verifying_key().to_bytes();
+    let params = RepoParams::from_owner(&owner_pub, freenet_git_types::limits::DEFAULT_PREFIX_LEN);
 
     let mut state = RepoState::default();
+    state.owner = owner_pub;
     state.name = Some(sign_string_field(&params, owner, "name", "demo".into(), 1));
     state.description = Some(sign_string_field(
         &params,

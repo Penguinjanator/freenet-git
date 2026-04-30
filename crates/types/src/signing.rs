@@ -22,7 +22,7 @@ pub fn sign_string_field(
     value: String,
     update_seq: u64,
 ) -> SignedField<String> {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_string_field(&repo_key, field_name, &value, update_seq);
     let sig = sign_to_array(key, &payload);
     SignedField {
@@ -40,7 +40,7 @@ pub fn sign_ref_list_field(
     value: Vec<RefName>,
     update_seq: u64,
 ) -> SignedField<Vec<RefName>> {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_ref_list_field(&repo_key, field_name, &value, update_seq);
     let sig = sign_to_array(key, &payload);
     SignedField {
@@ -58,7 +58,7 @@ pub fn sign_acl_field(
     value: AclState,
     update_seq: u64,
 ) -> SignedField<AclState> {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_acl_field(&repo_key, field_name, &value, update_seq);
     let sig = sign_to_array(key, &payload);
     SignedField {
@@ -76,7 +76,7 @@ pub fn sign_optional_repo_key_field(
     value: Option<RepoKey>,
     update_seq: u64,
 ) -> SignedField<Option<RepoKey>> {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload =
         signed_payload_optional_repo_key_field(&repo_key, field_name, value.as_ref(), update_seq);
     let sig = sign_to_array(key, &payload);
@@ -98,7 +98,7 @@ pub fn sign_ref_entry(
     update_seq: u64,
     auth_epoch: u64,
 ) -> RefEntry {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_ref_entry(&repo_key, ref_name, &target, update_seq, auth_epoch);
     let sig = sign_to_array(key, &payload);
     RefEntry {
@@ -117,7 +117,7 @@ pub fn sign_bundle_record(
     bundle: ObjectBundle,
     auth_epoch: u64,
 ) -> ObjectBundleRecord {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_bundle_record(&repo_key, &bundle, auth_epoch);
     let sig = sign_to_array(key, &payload);
     ObjectBundleRecord {
@@ -136,7 +136,7 @@ pub fn sign_extension(
     value: Vec<u8>,
     update_seq: u64,
 ) -> ExtensionEntry {
-    let repo_key = signature_domain_key(params);
+    let repo_key = signature_domain_key(params, &key.verifying_key().to_bytes());
     let payload = signed_payload_extension(&repo_key, ext_key, &value, update_seq);
     let sig = sign_to_array(key, &payload);
     ExtensionEntry {

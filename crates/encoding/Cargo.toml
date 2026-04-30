@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+keywords = ["freenet", "git", "encoding", "decentralized", "signing"]
+categories = ["encoding", "cryptography"]
 
 [dependencies]
 blake3.workspace = true

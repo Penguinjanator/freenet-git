@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+keywords = ["freenet", "git", "decentralized", "crdt", "contract"]
+categories = ["data-structures", "cryptography"]
 
 [dependencies]
 freenet-git-encoding = { workspace = true }
@@ -15,6 +17,7 @@ serde = { workspace = true }
 serde_bytes = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
+bs58 = { workspace = true }
 thiserror = { workspace = true }
 
 # We do NOT pull in ed25519-dalek directly inside the contract WASM because the

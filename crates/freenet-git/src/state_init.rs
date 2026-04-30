@@ -21,6 +21,7 @@ pub fn initial_repo_state(
     default_branch: &str,
 ) -> RepoState {
     let mut state = RepoState::default();
+    state.owner = owner.verifying_key().to_bytes();
     state.name = Some(sign_string_field(
         params,
         owner,
@@ -73,10 +74,8 @@ mod tests {
     #[test]
     fn initial_state_validates() {
         let signing = SigningKey::from_bytes(&[7u8; 32]);
-        let params = RepoParams {
-            owner: signing.verifying_key().to_bytes(),
-            repo_nonce: [11u8; 16],
-        };
+        let owner = signing.verifying_key().to_bytes();
+        let params = RepoParams::from_owner(&owner, freenet_git_types::limits::DEFAULT_PREFIX_LEN);
         let state = initial_repo_state(
             &params,
             &signing,

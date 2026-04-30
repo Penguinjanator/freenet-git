@@ -5,11 +5,16 @@
 
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 
-use freenet_git_types::{RepoNonce, RepoParams};
+use freenet_git_types::RepoParams;
 
-/// Compute the [`ContractInstanceId`] of a repo contract from its parameters
-/// and the WASM bytes of `freenet-git-repo-contract`.
-pub fn repo_contract_id(repo_wasm: &[u8], params: &RepoParams) -> ContractInstanceId {
+/// Compute the [`ContractInstanceId`] of a repo contract from a URL prefix
+/// (the value the user shared) and the WASM bytes of
+/// `freenet-git-repo-contract`. The contract key is
+/// `BLAKE3(BLAKE3(WASM) || serialize({prefix}))`.
+pub fn repo_contract_id_from_prefix(repo_wasm: &[u8], prefix: &str) -> ContractInstanceId {
+    let params = RepoParams {
+        prefix: prefix.to_string(),
+    };
     let parameters = Parameters::from(params.to_bytes());
     let code = ContractCode::from(repo_wasm.to_vec());
     ContractInstanceId::from_params_and_code(parameters, code)
@@ -26,46 +31,39 @@ pub fn pack_contract_id(pack_wasm: &[u8], pack_bytes: &[u8]) -> ContractInstance
     ContractInstanceId::from_params_and_code(parameters, code)
 }
 
-/// Generate a random 16-byte [`RepoNonce`] for a freshly-created repo.
-pub fn fresh_repo_nonce() -> RepoNonce {
-    use rand::RngCore;
-    let mut nonce = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    nonce
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Same parameters and wasm produce the same contract id (sanity check
+    /// Same prefix and wasm produce the same contract id (sanity check
     /// that the stdlib helper is doing what we think).
     #[test]
     fn repo_id_is_stable_for_fixed_inputs() {
         let wasm = b"fake-repo-wasm-bytes".to_vec();
-        let params = RepoParams {
-            owner: [9u8; 32],
-            repo_nonce: [3u8; 16],
-        };
-        let id_a = repo_contract_id(&wasm, &params);
-        let id_b = repo_contract_id(&wasm, &params);
+        let id_a = repo_contract_id_from_prefix(&wasm, "abc1234567");
+        let id_b = repo_contract_id_from_prefix(&wasm, "abc1234567");
         assert_eq!(id_a, id_b);
     }
 
-    /// Different repo nonces produce different ids — that's the whole
-    /// reason `repo_nonce` is in parameters.
+    /// Different prefixes produce different ids.
     #[test]
-    fn repo_nonce_changes_id() {
+    fn different_prefix_changes_id() {
         let wasm = b"fake-repo-wasm-bytes".to_vec();
-        let p1 = RepoParams {
-            owner: [9u8; 32],
-            repo_nonce: [3u8; 16],
-        };
-        let p2 = RepoParams {
-            owner: [9u8; 32],
-            repo_nonce: [4u8; 16],
-        };
-        assert_ne!(repo_contract_id(&wasm, &p1), repo_contract_id(&wasm, &p2));
+        assert_ne!(
+            repo_contract_id_from_prefix(&wasm, "abc1234567"),
+            repo_contract_id_from_prefix(&wasm, "xyz1234567"),
+        );
+    }
+
+    /// Different prefix lengths for the same logical owner produce
+    /// different contract ids — same owner key, two different repos.
+    #[test]
+    fn prefix_length_changes_id() {
+        let wasm = b"fake-repo-wasm-bytes".to_vec();
+        assert_ne!(
+            repo_contract_id_from_prefix(&wasm, "abc1234567"),
+            repo_contract_id_from_prefix(&wasm, "abc12345678"),
+        );
     }
 
     #[test]

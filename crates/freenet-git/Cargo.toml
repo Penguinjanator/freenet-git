@@ -1,6 +1,6 @@
 [package]
 name = "freenet-git"
-description = "Companion CLI for hosting and consuming git repositories on Freenet"
+description = "Push, fetch, and clone Git repositories through Freenet instead of a centralized host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,23 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+readme = "README.md"
+keywords = ["freenet", "git", "decentralized", "p2p", "git-remote-helper"]
+categories = ["command-line-utilities", "development-tools::version-control"]
+include = [
+    "src/**/*",
+    "contracts/*.wasm",
+    "Cargo.toml",
+    "README.md",
+]
 
 [[bin]]
 name = "freenet-git"
 path = "src/main.rs"
+
+[[bin]]
+name = "git-remote-freenet"
+path = "src/bin/git-remote-freenet.rs"
 
 [lib]
 name = "freenet_git_cli"

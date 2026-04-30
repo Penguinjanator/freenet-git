@@ -45,16 +45,30 @@ pub mod limits {
     pub const MAX_EXTENSION_KEY_BYTES: usize = 256;
     /// Maximum length of any single extension value.
     pub const MAX_EXTENSION_VALUE_BYTES: usize = 64 * 1024;
+    /// Minimum length of a [`RepoParams`](super::RepoParams) prefix, in
+    /// base58 characters.
+    pub const MIN_PREFIX_LEN: usize = 4;
+    /// Maximum length of a [`RepoParams`](super::RepoParams) prefix, in
+    /// base58 characters. The full base58 of a 32-byte ed25519 public key
+    /// is at most 44 characters, but we cap at 32 to leave headroom for
+    /// future fingerprint formats.
+    pub const MAX_PREFIX_LEN: usize = 32;
+    /// Default prefix length the CLI emits for new repos.
+    ///
+    /// 12 base58 chars ≈ 70 bits of entropy. Birthday collision space is
+    /// ~2^35 ≈ 34 billion repos — comfortably past any plausible Freenet
+    /// adoption. Targeted preimage is 2^70, infeasible at any scale.
+    /// We can lengthen later (the contract WASM accepts any prefix length
+    /// in the 4..=32 range) without a migration.
+    pub const DEFAULT_PREFIX_LEN: usize = 12;
 }
 
-/// Owner public key, embedded in [`RepoParams`].
+/// Owner public key, lives in [`RepoState`] and is checked by
+/// `validate_state` against the prefix in parameters.
 pub type PublicKey = [u8; 32];
 
 /// ed25519 signature.
 pub type Signature = [u8; 64];
-
-/// Random nonce that ensures one owner can have many repos with stable URLs.
-pub type RepoNonce = [u8; 16];
 
 /// BLAKE3-32 of a packfile's bytes.
 pub type PackHash = [u8; 32];
@@ -92,16 +106,36 @@ pub type RefName = String;
 
 /// Initial parameters, immutable, part of the contract key via
 /// `BLAKE3(BLAKE3(WASM) || Parameters)`.
+///
+/// The parameters carry only the **prefix** — the first N base58
+/// characters of the owner's ed25519 public key. The owner pubkey
+/// itself lives in [`RepoState`] (`state.owner`) and is checked by
+/// [`validate_state`] against this prefix.
+///
+/// This means the URL — which is just the prefix — is short and
+/// readable, but anyone who has the URL plus the bundled contract WASM
+/// can compute the full contract key (`BLAKE3(BLAKE3(WASM) ||
+/// CBOR({prefix}))`). Two different prefix lengths produce two
+/// different contract keys, so the same owner can have many repos at
+/// different prefix lengths — though in practice we always use
+/// [`limits::DEFAULT_PREFIX_LEN`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoParams {
-    /// Creator's identity. Fixed for the contract's lifetime.
-    pub owner: PublicKey,
-    /// Random nonce so the same owner can have multiple repos with stable
-    /// URLs even if names collide.
-    pub repo_nonce: RepoNonce,
+    /// Base58 prefix of the owner's ed25519 public key. Length must be
+    /// in the `[MIN_PREFIX_LEN..=MAX_PREFIX_LEN]` range.
+    pub prefix: String,
 }
 
 impl RepoParams {
+    /// Construct parameters from an owner pubkey and prefix length.
+    /// Caller must ensure `len` is in the valid range; consumers
+    /// double-check via [`validate_state`].
+    pub fn from_owner(owner: &PublicKey, len: usize) -> Self {
+        Self {
+            prefix: pubkey_prefix(owner, len),
+        }
+    }
+
     /// Encode as bytes for use as the `Parameters` payload of the contract.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(self).expect("RepoParams serialization is infallible")
@@ -111,6 +145,15 @@ impl RepoParams {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ValidateError> {
         bincode::deserialize(bytes).map_err(|e| ValidateError::DecodeParams(e.to_string()))
     }
+}
+
+/// Compute the canonical prefix of an owner pubkey at a given length:
+/// `base58(owner)[..len]`, with `len` saturated to the encoded string's
+/// actual length so we never index past the end.
+pub fn pubkey_prefix(owner: &PublicKey, len: usize) -> String {
+    let encoded = bs58::encode(owner).into_string();
+    let take = len.min(encoded.len());
+    encoded[..take].to_string()
 }
 
 /// A field that carries its own owner signature so a peer can verify it
@@ -255,6 +298,12 @@ pub struct ExtensionEntry {
 /// The full mutable state of a repo contract.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoState {
+    /// The owner's ed25519 public key. `validate_state` enforces that
+    /// `base58(owner)[..params.prefix.len()] == params.prefix`. The
+    /// owner is implicitly authenticated through every signed field —
+    /// changing it would invalidate all signatures, since the signature
+    /// domain key derives from prefix + owner.
+    pub owner: PublicKey,
     /// Display name of the repo.
     pub name: Option<SignedField<String>>,
     /// Free-form description.
@@ -324,6 +373,28 @@ pub enum ValidateError {
     /// `acl.epoch` went backwards or `update_seq` is non-monotonic.
     #[error("monotonic invariant violated: {0}")]
     NonMonotonic(&'static str),
+    /// `params.prefix` length is outside `[MIN_PREFIX_LEN..=MAX_PREFIX_LEN]`.
+    #[error("prefix length {len} outside valid range [{min}..={max}]")]
+    InvalidPrefixLength {
+        /// Observed prefix length.
+        len: usize,
+        /// Minimum allowed.
+        min: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+    /// `state.owner` does not produce `params.prefix` when base58-encoded.
+    #[error("owner pubkey does not match parameters prefix: expected {expected}, got {actual}")]
+    PrefixMismatch {
+        /// Prefix declared in parameters.
+        expected: String,
+        /// Prefix actually derived from `state.owner`.
+        actual: String,
+    },
+    /// `params.prefix` contains characters outside the Bitcoin base58
+    /// alphabet.
+    #[error("prefix contains invalid base58 characters")]
+    InvalidPrefixChars,
 }
 
 /// Run the full contract `validate_state` check.
@@ -333,11 +404,33 @@ pub enum ValidateError {
 /// isolation; rejects any state that does not exclusively consist of
 /// owner-signed entries.
 pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), ValidateError> {
-    let repo_key = params_repo_key(params);
+    // 1. Validate prefix length is in range.
+    if params.prefix.len() < limits::MIN_PREFIX_LEN || params.prefix.len() > limits::MAX_PREFIX_LEN
+    {
+        return Err(ValidateError::InvalidPrefixLength {
+            len: params.prefix.len(),
+            min: limits::MIN_PREFIX_LEN,
+            max: limits::MAX_PREFIX_LEN,
+        });
+    }
+    // 2. Validate prefix characters are base58 (catches typos and
+    //    keeps the prefix domain narrow).
+    if bs58::decode(&params.prefix).into_vec().is_err() {
+        return Err(ValidateError::InvalidPrefixChars);
+    }
+    // 3. Validate owner pubkey produces the declared prefix.
+    let actual_prefix = pubkey_prefix(&state.owner, params.prefix.len());
+    if actual_prefix != params.prefix {
+        return Err(ValidateError::PrefixMismatch {
+            expected: params.prefix.clone(),
+            actual: actual_prefix,
+        });
+    }
+    let repo_key = params_repo_key(params, &state.owner);
 
     if let Some(field) = &state.name {
         check_size("name", field.value.len(), limits::MAX_NAME_BYTES)?;
-        verify_signed_field_string(&repo_key, "name", &params.owner, field, "name")?;
+        verify_signed_field_string(&repo_key, "name", &state.owner, field, "name")?;
     }
     if let Some(field) = &state.description {
         check_size(
@@ -345,13 +438,7 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
             field.value.len(),
             limits::MAX_DESCRIPTION_BYTES,
         )?;
-        verify_signed_field_string(
-            &repo_key,
-            "description",
-            &params.owner,
-            field,
-            "description",
-        )?;
+        verify_signed_field_string(&repo_key, "description", &state.owner, field, "description")?;
     }
     if let Some(field) = &state.default_branch {
         check_size(
@@ -362,7 +449,7 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
         verify_signed_field_string(
             &repo_key,
             "default_branch",
-            &params.owner,
+            &state.owner,
             field,
             "default_branch",
         )?;
@@ -371,19 +458,19 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
         verify_signed_field_ref_list(
             &repo_key,
             "force_push_allowed",
-            &params.owner,
+            &state.owner,
             field,
             "force_push_allowed",
         )?;
     }
     if let Some(field) = &state.acl {
-        verify_signed_field_acl(&repo_key, "acl", &params.owner, field, "acl")?;
+        verify_signed_field_acl(&repo_key, "acl", &state.owner, field, "acl")?;
     }
     if let Some(field) = &state.upgrade {
         verify_signed_field_optional_repo_key(
             &repo_key,
             "upgrade",
-            &params.owner,
+            &state.owner,
             field,
             "upgrade",
         )?;
@@ -392,7 +479,7 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
     for (ref_name, entry) in &state.refs {
         check_size("ref name", ref_name.len(), limits::MAX_REF_NAME_BYTES)?;
         // Phase 1.0: only owner-signed refs are accepted.
-        if entry.updater != params.owner {
+        if entry.updater != state.owner {
             return Err(ValidateError::NonOwnerSigner);
         }
         verify_ref_entry(&repo_key, ref_name, entry)?;
@@ -402,7 +489,7 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
         if record.bundle.id() != *bundle_id {
             return Err(ValidateError::BundleIdMismatch);
         }
-        if record.added_by != params.owner {
+        if record.added_by != state.owner {
             return Err(ValidateError::NonOwnerSigner);
         }
         verify_bundle_record(&repo_key, record)?;
@@ -419,7 +506,7 @@ pub fn validate_state(params: &RepoParams, state: &RepoState) -> Result<(), Vali
             entry.value.len(),
             limits::MAX_EXTENSION_VALUE_BYTES,
         )?;
-        verify_extension_entry(&repo_key, ext_key, &params.owner, entry)?;
+        verify_extension_entry(&repo_key, ext_key, &state.owner, entry)?;
     }
 
     Ok(())
@@ -726,26 +813,27 @@ pub fn signed_payload_extension(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Compute the abstract repo key from parameters: `BLAKE3-32(WIRE_VERSION ||
-/// owner || repo_nonce)`. This is only used as the *signature domain* repo
-/// key — Freenet computes the actual contract key separately as
-/// `BLAKE3(BLAKE3(WASM) || Parameters)`. We keep our signature-domain key
-/// stable across WASM rebuilds, so a contract WASM bump does not invalidate
-/// every signature in the repo's history. (When the WASM hash is ALSO part
-/// of the signature domain, signatures from older WASMs would no longer
-/// verify under the new one, which would block the upgrade pointer story.)
-fn params_repo_key(params: &RepoParams) -> RepoKey {
+/// Compute the abstract repo key used in every signed payload as a
+/// domain-separating prefix: `BLAKE3-32(WIRE_VERSION || prefix || owner)`.
+///
+/// This is only used as the *signature domain* repo key — Freenet computes
+/// the actual contract key separately as `BLAKE3(BLAKE3(WASM) ||
+/// Parameters)`. Keeping the signature domain stable across WASM rebuilds
+/// means a contract WASM bump does not invalidate every signature in the
+/// repo's history; only the contract key changes (as it must — that is
+/// what migration via the upgrade pointer is for).
+fn params_repo_key(params: &RepoParams, owner: &PublicKey) -> RepoKey {
     let mut h = blake3::Hasher::new();
     h.update(WIRE_VERSION.as_bytes());
-    h.update(&params.owner);
-    h.update(&params.repo_nonce);
+    h.update(params.prefix.as_bytes());
+    h.update(owner);
     *h.finalize().as_bytes()
 }
 
 /// Public version of [`params_repo_key`] for callers that need the same
 /// derivation when constructing signed payloads.
-pub fn signature_domain_key(params: &RepoParams) -> RepoKey {
-    params_repo_key(params)
+pub fn signature_domain_key(params: &RepoParams, owner: &PublicKey) -> RepoKey {
+    params_repo_key(params, owner)
 }
 
 fn check_size(field: &'static str, len: usize, max: usize) -> Result<(), ValidateError> {
@@ -927,28 +1015,56 @@ mod tests {
     use super::*;
 
     /// `params_repo_key` does not depend on the contract WASM hash, so two
-    /// different WASMs with the same parameters produce the same
-    /// signature domain key. Without this property, every contract WASM
-    /// upgrade would invalidate every historical signature.
+    /// different WASMs with the same parameters and owner produce the
+    /// same signature domain key. Without this property, every contract
+    /// WASM upgrade would invalidate every historical signature.
     #[test]
     fn signature_domain_key_is_wasm_independent() {
-        let params = RepoParams {
-            owner: [1u8; 32],
-            repo_nonce: [2u8; 16],
-        };
-        let k = signature_domain_key(&params);
+        let owner = [1u8; 32];
+        let params = RepoParams::from_owner(&owner, limits::DEFAULT_PREFIX_LEN);
+        let k = signature_domain_key(&params, &owner);
         assert_eq!(k.len(), 32);
         // Stability: same inputs => same output across runs.
-        assert_eq!(signature_domain_key(&params), k);
+        assert_eq!(signature_domain_key(&params, &owner), k);
     }
 
     #[test]
-    fn empty_state_validates() {
-        let params = RepoParams {
-            owner: [3u8; 32],
-            repo_nonce: [4u8; 16],
-        };
+    fn default_state_with_matching_prefix_validates() {
+        // RepoState::default() has owner = [0; 32]. Build matching params.
+        let owner = [0u8; 32];
+        let params = RepoParams::from_owner(&owner, limits::DEFAULT_PREFIX_LEN);
         assert!(validate_state(&params, &RepoState::default()).is_ok());
+    }
+
+    #[test]
+    fn prefix_mismatch_rejected() {
+        let owner = [3u8; 32];
+        let other = [4u8; 32];
+        let params = RepoParams::from_owner(&owner, limits::DEFAULT_PREFIX_LEN);
+        let mut state = RepoState::default();
+        state.owner = other;
+        match validate_state(&params, &state) {
+            Err(ValidateError::PrefixMismatch { .. }) => {}
+            other => panic!("expected PrefixMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn invalid_prefix_length_rejected() {
+        let too_short = RepoParams {
+            prefix: "abc".into(),
+        };
+        match validate_state(&too_short, &RepoState::default()) {
+            Err(ValidateError::InvalidPrefixLength { len: 3, .. }) => {}
+            other => panic!("expected InvalidPrefixLength, got {:?}", other),
+        }
+        let too_long = RepoParams {
+            prefix: "a".repeat(33),
+        };
+        match validate_state(&too_long, &RepoState::default()) {
+            Err(ValidateError::InvalidPrefixLength { len: 33, .. }) => {}
+            other => panic!("expected InvalidPrefixLength, got {:?}", other),
+        }
     }
 
     #[test]
@@ -995,11 +1111,10 @@ mod tests {
 
     #[test]
     fn name_size_limit_is_enforced() {
-        let params = RepoParams {
-            owner: [5u8; 32],
-            repo_nonce: [6u8; 16],
-        };
+        let owner = [5u8; 32];
+        let params = RepoParams::from_owner(&owner, limits::DEFAULT_PREFIX_LEN);
         let mut state = RepoState::default();
+        state.owner = owner;
         state.name = Some(SignedField {
             value: "x".repeat(limits::MAX_NAME_BYTES + 1),
             update_seq: 1,

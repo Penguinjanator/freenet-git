@@ -19,14 +19,16 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use freenet_git_cli::ids::{fresh_repo_nonce, repo_contract_id};
+use ed25519_dalek::SigningKey;
+use freenet_git_cli::ids::repo_contract_id_from_prefix;
 use freenet_git_cli::state_init::initial_repo_state;
 use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{
     default_bundle_path, read_bundle, seal, write_bundle, DecryptedBundle, RepoRegistryEntry,
 };
-use freenet_git_types::RepoParams;
+use freenet_git_types::{limits, pubkey_prefix, RepoParams};
+use rand::rngs::OsRng;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,9 +84,11 @@ enum Cmd {
         /// Default branch.
         #[arg(long, default_value = "refs/heads/main")]
         default_branch: String,
-        /// Path to the compiled repo-contract WASM.
+        /// Override the bundled repo-contract WASM. Normally you do not
+        /// need this — `cargo install freenet-git` ships the right bytes.
+        /// Useful when iterating on the contract from source.
         #[arg(long)]
-        repo_wasm: PathBuf,
+        repo_wasm: Option<PathBuf>,
         /// WebSocket URL of a local Freenet node. Defaults to the
         /// stdlib's standard endpoint
         /// (`ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native`).
@@ -137,7 +141,7 @@ fn run(cli: Cli) -> Result<()> {
             &name,
             &description,
             &default_branch,
-            &repo_wasm,
+            repo_wasm.as_deref(),
             publish_to.as_deref(),
             no_publish,
             Duration::from_secs(publish_timeout_secs),
@@ -171,7 +175,12 @@ fn whoami(path: &std::path::Path) -> Result<()> {
         println!();
         println!("Repos in registry:");
         for r in &bundle.repos {
-            println!("  {} -> {}", r.display_name, r.last_known_url);
+            let label = if r.display_name.is_empty() {
+                None
+            } else {
+                Some(r.display_name.as_str())
+            };
+            println!("  {}", url::format_with_label(&r.prefix, label));
         }
     }
     Ok(())
@@ -215,36 +224,47 @@ fn create_repo(
     name: &str,
     description: &str,
     default_branch: &str,
-    repo_wasm_path: &std::path::Path,
+    repo_wasm_path: Option<&std::path::Path>,
     publish_to: Option<&str>,
     no_publish: bool,
     publish_timeout: Duration,
 ) -> Result<()> {
     let bundle = open_bundle_with_prompt(bundle_path)?;
-    let signing = bundle.signing_key()?;
-    let owner = signing.verifying_key().to_bytes();
 
-    let repo_wasm = std::fs::read(repo_wasm_path)
-        .with_context(|| format!("read repo-contract wasm from {}", repo_wasm_path.display()))?;
-
-    let nonce = fresh_repo_nonce();
-    let params = RepoParams {
-        owner,
-        repo_nonce: nonce,
+    let repo_wasm: Vec<u8> = match repo_wasm_path {
+        Some(path) => std::fs::read(path)
+            .with_context(|| format!("read repo-contract wasm from {}", path.display()))?,
+        None => freenet_git_cli::REPO_CONTRACT_WASM.to_vec(),
     };
-    let initial_state = initial_repo_state(&params, &signing, name, description, default_branch);
 
-    let contract_id = repo_contract_id(&repo_wasm, &params);
-    let repo_url = url::format(&contract_id);
+    // Generate a fresh per-repo keypair. The URL prefix is derived
+    // from this key, so a fresh repo means a fresh keypair (this is
+    // the delta site model).
+    let repo_signing = SigningKey::generate(&mut OsRng);
+    let repo_owner = repo_signing.verifying_key().to_bytes();
+    let prefix = pubkey_prefix(&repo_owner, limits::DEFAULT_PREFIX_LEN);
+    let params = RepoParams {
+        prefix: prefix.clone(),
+    };
+    let initial_state =
+        initial_repo_state(&params, &repo_signing, name, description, default_branch);
 
-    let git_url = url::format_git_url(&contract_id);
+    let contract_id = repo_contract_id_from_prefix(&repo_wasm, &prefix);
+    // Use the repo name as the URL label so `git clone` produces a
+    // human-friendly directory name. The label is purely cosmetic; the
+    // prefix is the only authoritative identifier.
+    let label = if name.is_empty() { None } else { Some(name) };
+    let repo_url = url::format_with_label(&prefix, label);
+    let git_url = url::format_git_url_with_label(&prefix, label);
     println!("Repo prepared:");
     println!("  Name:        {name}");
     println!("  Description: {description}");
     println!("  Default ref: {default_branch}");
-    println!("  Owner:       {}", bundle.id_string());
+    println!("  Identity:    {} (this user)", bundle.id_string());
+    println!("  Owner:       {} (this repo)", repo_id_string(&repo_owner));
     println!("  URL:         {repo_url}");
     println!("  git URL:     {git_url}");
+    println!("  Contract id: {contract_id}");
     println!();
     println!(
         "Initial signed state size: {} bytes",
@@ -253,8 +273,8 @@ fn create_repo(
 
     if no_publish {
         // Hand-off mode: write artefacts for fdev publish.
-        let parameters_path = format!("/tmp/freenet-git-params-{}.bin", nonce_hex(&nonce));
-        let state_path = format!("/tmp/freenet-git-state-{}.bin", nonce_hex(&nonce));
+        let parameters_path = format!("/tmp/freenet-git-params-{prefix}.bin");
+        let state_path = format!("/tmp/freenet-git-state-{prefix}.bin");
         std::fs::write(&parameters_path, params.to_bytes())?;
         std::fs::write(&state_path, initial_state.to_bytes())?;
         println!();
@@ -262,12 +282,15 @@ fn create_repo(
         println!("  parameters: {parameters_path}");
         println!("  state:      {state_path}");
         println!();
+        let repo_wasm_path_str = match repo_wasm_path {
+            Some(p) => p.display().to_string(),
+            None => "<bundled-repo-contract.wasm>".to_string(),
+        };
         println!("To publish manually, e.g. with fdev:");
         println!(
-            "  fdev publish --code {} --parameters {parameters_path} contract --state {state_path}",
-            repo_wasm_path.display()
+            "  fdev publish --code {repo_wasm_path_str} --parameters {parameters_path} contract --state {state_path}",
         );
-        return register_in_bundle(bundle, bundle_path, &nonce, &repo_url, name);
+        return register_in_bundle(bundle, bundle_path, &repo_signing, &prefix, name);
     }
 
     let ws_url = publish_to.unwrap_or(DEFAULT_WS_URL).to_string();
@@ -293,20 +316,21 @@ fn create_repo(
 
     println!("PUT confirmed by host. Contract key: {}", key.id());
 
-    register_in_bundle(bundle, bundle_path, &nonce, &repo_url, name)
+    register_in_bundle(bundle, bundle_path, &repo_signing, &prefix, name)
 }
 
 fn register_in_bundle(
     bundle: DecryptedBundle,
     bundle_path: &std::path::Path,
-    nonce: &[u8; 16],
-    repo_url: &str,
+    repo_signing: &SigningKey,
+    prefix: &str,
     name: &str,
 ) -> Result<()> {
     let mut bundle_with_repo = bundle;
     bundle_with_repo.repos.push(RepoRegistryEntry {
-        repo_nonce: nonce.to_vec(),
-        last_known_url: repo_url.to_string(),
+        repo_secret: repo_signing.to_bytes().to_vec(),
+        repo_public: repo_signing.verifying_key().to_bytes().to_vec(),
+        prefix: prefix.to_string(),
         display_name: name.to_string(),
     });
     let pw = prompt_passphrase("Passphrase to update bundle (registry entry)")?;
@@ -314,6 +338,10 @@ fn register_in_bundle(
     println!();
     println!("Registered repo in identity bundle.");
     Ok(())
+}
+
+fn repo_id_string(pubkey: &[u8]) -> String {
+    format!("freenet:id:{}", bs58::encode(pubkey).into_string())
 }
 
 fn open_bundle_with_prompt(path: &std::path::Path) -> Result<DecryptedBundle> {
@@ -358,15 +386,6 @@ fn prompt_passphrase_with_confirm(prompt: &str) -> Result<String> {
         bail!("passphrases did not match");
     }
     Ok(pw)
-}
-
-fn nonce_hex(nonce: &[u8; 16]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(32);
-    for b in nonce {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 fn init_tracing() {

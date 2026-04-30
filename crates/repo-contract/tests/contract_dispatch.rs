@@ -21,14 +21,14 @@ fn fixed_key(seed: u8) -> SigningKey {
 }
 
 fn make_params(owner: &SigningKey) -> RepoParams {
-    RepoParams {
-        owner: owner.verifying_key().to_bytes(),
-        repo_nonce: [9u8; 16],
-    }
+    let pub_bytes = owner.verifying_key().to_bytes();
+    RepoParams::from_owner(&pub_bytes, freenet_git_types::limits::DEFAULT_PREFIX_LEN)
 }
 
 fn make_signed_state(owner: &SigningKey, params: &RepoParams, target: [u8; 20]) -> RepoState {
+    let owner_pub = owner.verifying_key().to_bytes();
     let mut state = RepoState {
+        owner: owner_pub,
         name: Some(sign_string_field(params, owner, "name", "demo".into(), 1)),
         ..Default::default()
     };
