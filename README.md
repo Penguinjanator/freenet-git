@@ -3,10 +3,27 @@
 Git over [Freenet](https://freenet.org). Push, fetch, and clone Git repositories
 through the Freenet network instead of a centralized host.
 
-> **Status: Phase 1 in progress.** This is the initial implementation tracked in
+> **Status: Phase 1 in progress.** Tracked in
 > [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
-> The CLI works against local Freenet nodes; full network deployment is gated on
-> the issues listed under "Roadmap" below.
+>
+> What works today:
+> - Two contract WASMs (`pack-contract`, `repo-contract`) with full
+>   single-writer `validate_state` / `update_state` / CRDT merge logic.
+> - Identity bundle (`scrypt` + ChaCha20-Poly1305, downgrade-resistant via
+>   AEAD associated data on the KDF parameters).
+> - `freenet-git` CLI: `init-identity`, `whoami`, `export-identity`,
+>   `import-identity`, `create` (offline — derives the contract URL,
+>   builds the signed initial state, and registers the repo in the
+>   identity bundle).
+> - 46 tests passing across the workspace.
+>
+> Not yet wired up:
+> - Network publish from `freenet-git create` (the WS API call to PUT
+>   the repo contract). Today the CLI prints the URL and writes the
+>   parameters/state to disk for hand-off to `fdev publish`.
+> - The `git-remote-freenet` helper (push, fetch, list).
+> - `info`, `subscribe`, `subscriptions`, `status`, `rename`, `rescue`.
+> - End-to-end test against two local nodes.
 
 ## What this is
 

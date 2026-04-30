@@ -1,0 +1,43 @@
+[package]
+name = "freenet-git"
+description = "Companion CLI for hosting and consuming git repositories on Freenet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "freenet-git"
+path = "src/main.rs"
+
+[lib]
+name = "freenet_git_cli"
+path = "src/lib.rs"
+
+[dependencies]
+freenet-git-encoding = { workspace = true }
+freenet-git-types = { workspace = true, features = ["signing"] }
+freenet-git-identity = { workspace = true }
+freenet-stdlib = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+clap = { workspace = true }
+rpassword = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bs58 = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+bincode = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+assert_cmd = "2"
+predicates = "3"

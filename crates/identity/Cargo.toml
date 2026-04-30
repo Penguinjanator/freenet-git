@@ -1,0 +1,27 @@
+[package]
+name = "freenet-git-identity"
+description = "Passphrase-encrypted ed25519 identity bundle for freenet-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+scrypt = { workspace = true }
+chacha20poly1305 = { workspace = true }
+serde = { workspace = true }
+serde_bytes = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+bs58 = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

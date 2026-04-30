@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/encoding",
     "crates/types",
+    "crates/identity",
     "crates/pack-contract",
     "crates/repo-contract",
+    "crates/freenet-git",
 ]
 
 [workspace.package]
