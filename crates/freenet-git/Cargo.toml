@@ -10,7 +10,7 @@ homepage.workspace = true
 authors.workspace = true
 readme = "README.md"
 keywords = ["freenet", "git", "decentralized", "p2p", "git-remote-helper"]
-categories = ["command-line-utilities", "development-tools::version-control"]
+categories = ["command-line-utilities", "development-tools"]
 include = [
     "src/**/*",
     "contracts/*.wasm",
