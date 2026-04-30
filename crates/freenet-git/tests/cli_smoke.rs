@@ -138,6 +138,7 @@ fn create_repo_prints_url_and_writes_temp_artifacts() {
         "demo",
         "--description",
         "a demo repo",
+        "--no-publish",
         "--repo-wasm",
     ]);
     create.arg(&fake_wasm);

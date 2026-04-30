@@ -15,11 +15,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{anyhow, bail, Context, Result};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use freenet_git_cli::ids::{fresh_repo_nonce, repo_contract_id};
 use freenet_git_cli::state_init::initial_repo_state;
 use freenet_git_cli::url;
+use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{
     default_bundle_path, read_bundle, seal, write_bundle, DecryptedBundle, RepoRegistryEntry,
 };
@@ -68,7 +71,7 @@ enum Cmd {
         from: PathBuf,
     },
     /// Derive the contract URL for a brand-new repo, build its initial
-    /// signed state, and (optionally) publish it.
+    /// signed state, and publish it to a local Freenet node.
     Create {
         /// Display name for the repo.
         #[arg(long)]
@@ -79,15 +82,23 @@ enum Cmd {
         /// Default branch.
         #[arg(long, default_value = "refs/heads/main")]
         default_branch: String,
-        /// Path to the compiled repo-contract WASM. Required for both
-        /// the dry-run id derivation and (eventually) the WS PUT.
+        /// Path to the compiled repo-contract WASM.
         #[arg(long)]
         repo_wasm: PathBuf,
-        /// Optional: WebSocket URL of a local Freenet node, e.g.
-        /// `ws://127.0.0.1:50509/v1/contract/command`. When supplied the
-        /// CLI will (TODO) PUT the contract to that node.
+        /// WebSocket URL of a local Freenet node. Defaults to the
+        /// stdlib's standard endpoint
+        /// (`ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native`).
+        /// Pass `--no-publish` to skip the network call and just print
+        /// the would-be URL.
         #[arg(long)]
         publish_to: Option<String>,
+        /// Skip the network PUT entirely. Useful for `--dry-run`-style
+        /// previews or for hand-off to `fdev publish`.
+        #[arg(long, conflicts_with = "publish_to")]
+        no_publish: bool,
+        /// Override the default 60-second confirmation timeout.
+        #[arg(long, default_value = "60")]
+        publish_timeout_secs: u64,
     },
 }
 
@@ -117,6 +128,8 @@ fn run(cli: Cli) -> Result<()> {
             default_branch,
             repo_wasm,
             publish_to,
+            no_publish,
+            publish_timeout_secs,
         } => create_repo(
             &bundle_path,
             &name,
@@ -124,6 +137,8 @@ fn run(cli: Cli) -> Result<()> {
             &default_branch,
             &repo_wasm,
             publish_to.as_deref(),
+            no_publish,
+            Duration::from_secs(publish_timeout_secs),
         ),
     }
 }
@@ -192,6 +207,7 @@ fn import_identity(local_path: &std::path::Path, from: &std::path::Path) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_repo(
     bundle_path: &std::path::Path,
     name: &str,
@@ -199,6 +215,8 @@ fn create_repo(
     default_branch: &str,
     repo_wasm_path: &std::path::Path,
     publish_to: Option<&str>,
+    no_publish: bool,
+    publish_timeout: Duration,
 ) -> Result<()> {
     let bundle = open_bundle_with_prompt(bundle_path)?;
     let signing = bundle.signing_key()?;
@@ -229,38 +247,68 @@ fn create_repo(
         initial_state.to_bytes().len()
     );
 
-    if let Some(ws) = publish_to {
-        // TODO: open a WebSocket to `ws`, send a PUT request with the
-        //       repo-contract WASM, parameters, and signed initial state.
-        //       Wait for confirmation (subscribe-then-confirm with
-        //       adaptive timeout per the issue spec).
-        eprintln!("--publish-to was supplied but WS API publishing is not wired in yet.");
-        eprintln!("(planned: PUT to {ws})");
-        eprintln!("Use `fdev publish` from freenet-core for now, with these inputs:");
+    if no_publish {
+        // Hand-off mode: write artefacts for fdev publish.
         let parameters_path = format!("/tmp/freenet-git-params-{}.bin", nonce_hex(&nonce));
         let state_path = format!("/tmp/freenet-git-state-{}.bin", nonce_hex(&nonce));
         std::fs::write(&parameters_path, params.to_bytes())?;
         std::fs::write(&state_path, initial_state.to_bytes())?;
-        eprintln!("  parameters written to {parameters_path}");
-        eprintln!("  state written to       {state_path}");
-        return Err(anyhow!(
-            "automatic publish not yet implemented; hand off to fdev for now"
-        ));
+        println!();
+        println!("--no-publish: skipped network PUT.");
+        println!("  parameters: {parameters_path}");
+        println!("  state:      {state_path}");
+        println!();
+        println!("To publish manually, e.g. with fdev:");
+        println!(
+            "  fdev publish --code {} --parameters {parameters_path} contract --state {state_path}",
+            repo_wasm_path.display()
+        );
+        return register_in_bundle(bundle, bundle_path, &nonce, &repo_url, name);
     }
 
-    // Append to the bundle's registry so the user can recover the URL
-    // later via `whoami` even if they lose the URL itself.
+    let ws_url = publish_to.unwrap_or(DEFAULT_WS_URL).to_string();
+    println!();
+    println!("Publishing to {ws_url} ...");
+
+    let key = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(async {
+            let mut api = wsclient::connect(&ws_url).await?;
+            wsclient::put_contract(
+                &mut api,
+                repo_wasm,
+                params.to_bytes(),
+                initial_state.to_bytes(),
+                publish_timeout,
+            )
+            .await
+        })
+        .with_context(|| format!("PUT to {ws_url}"))?;
+
+    println!("PUT confirmed by host. Contract key: {}", key.id());
+
+    register_in_bundle(bundle, bundle_path, &nonce, &repo_url, name)
+}
+
+fn register_in_bundle(
+    bundle: DecryptedBundle,
+    bundle_path: &std::path::Path,
+    nonce: &[u8; 16],
+    repo_url: &str,
+    name: &str,
+) -> Result<()> {
     let mut bundle_with_repo = bundle;
     bundle_with_repo.repos.push(RepoRegistryEntry {
         repo_nonce: nonce.to_vec(),
-        last_known_url: repo_url.clone(),
+        last_known_url: repo_url.to_string(),
         display_name: name.to_string(),
     });
     let pw = prompt_passphrase("Passphrase to update bundle (registry entry)")?;
     write_bundle(&bundle_with_repo, &pw, bundle_path)?;
     println!();
     println!("Registered repo in identity bundle.");
-
     Ok(())
 }
 

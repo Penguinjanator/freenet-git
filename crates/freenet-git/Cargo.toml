@@ -21,7 +21,10 @@ path = "src/lib.rs"
 freenet-git-encoding = { workspace = true }
 freenet-git-types = { workspace = true, features = ["signing"] }
 freenet-git-identity = { workspace = true }
-freenet-stdlib = { workspace = true }
+freenet-stdlib = { workspace = true, features = ["net"] }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }
