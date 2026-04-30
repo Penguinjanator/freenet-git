@@ -124,3 +124,158 @@ pub async fn put_contract(
 pub fn instance_id(key: &ContractKey) -> ContractInstanceId {
     *key.id()
 }
+
+/// GET the current state of a contract by its instance id. Returns the
+/// raw state bytes — caller decodes (e.g. via `RepoState::from_bytes`).
+///
+/// Setting `subscribe: true` is intentional: we want the local node to
+/// keep the contract live for us so subsequent pushes/fetches don't have
+/// to re-discover peers from cold.
+pub async fn get_state(
+    web_api: &mut WebApi,
+    id: ContractInstanceId,
+    subscribe: bool,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let req = ContractRequest::Get {
+        key: id,
+        return_contract_code: false,
+        subscribe,
+        blocking_subscribe: false,
+    };
+    web_api
+        .send(ClientRequest::ContractOp(req))
+        .await
+        .map_err(|e| anyhow!("send GET: {e}"))?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for GET response after {timeout:?}");
+        }
+        let response = match tokio::time::timeout(remaining, web_api.recv()).await {
+            Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
+            Err(_) => bail!("timed out waiting for GET response after {timeout:?}"),
+        };
+        match response {
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: got_key,
+                state,
+                ..
+            }) => {
+                if got_key.id() != &id {
+                    tracing::debug!("ignoring GetResponse for unrelated key {}", got_key.id());
+                    continue;
+                }
+                return Ok(state.as_ref().to_vec());
+            }
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key: notif_key,
+                ..
+            }) => {
+                // Subscription noise; ignore until our GetResponse arrives.
+                tracing::debug!(
+                    "got UpdateNotification for {} while waiting for GET",
+                    notif_key.id()
+                );
+            }
+            other => {
+                tracing::debug!(?other, "ignoring non-GET response while waiting");
+            }
+        }
+    }
+}
+
+/// Send an UPDATE for a contract. The bytes given are interpreted by the
+/// contract's `update_state` (for the repo contract that's a serialized
+/// `RepoState` interpreted as a delta). Returns when the host confirms
+/// the update was applied (`UpdateResponse`) or an UpdateNotification for
+/// our key arrives.
+pub async fn update_state(
+    web_api: &mut WebApi,
+    id: ContractInstanceId,
+    delta_bytes: Vec<u8>,
+    timeout: Duration,
+) -> Result<()> {
+    use freenet_stdlib::prelude::{CodeHash, StateDelta, UpdateData};
+    // Update needs a full ContractKey (instance id + code hash). We don't
+    // know the code hash from the instance id alone, but the host does
+    // not actually re-derive it from the request — it uses the key only
+    // for routing. A zero CodeHash works as a placeholder; downstream
+    // matching is by `ContractKey::id()` only.
+    let key = ContractKey::from_id_and_code(id, CodeHash::new([0u8; 32]));
+    let req = ContractRequest::Update {
+        key,
+        data: UpdateData::Delta(StateDelta::from(delta_bytes)),
+    };
+    web_api
+        .send(ClientRequest::ContractOp(req))
+        .await
+        .map_err(|e| anyhow!("send UPDATE: {e}"))?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for UPDATE response after {timeout:?}");
+        }
+        let response = match tokio::time::timeout(remaining, web_api.recv()).await {
+            Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
+            Err(_) => bail!("timed out waiting for UPDATE response after {timeout:?}"),
+        };
+        match response {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+                key: got_key,
+                ..
+            }) => {
+                if got_key.id() == &id {
+                    return Ok(());
+                }
+                tracing::debug!("ignoring UpdateResponse for unrelated key {}", got_key.id());
+            }
+            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key: notif_key,
+                ..
+            }) => {
+                if notif_key.id() == &id {
+                    // Update echoed back means it was applied.
+                    return Ok(());
+                }
+                tracing::debug!("ignoring unrelated UpdateNotification");
+            }
+            HostResponse::Ok => return Ok(()),
+            other => {
+                tracing::debug!(?other, "ignoring non-UPDATE response while waiting");
+            }
+        }
+    }
+}
+
+/// PUT a pack contract. Uses the universal pack-contract WASM (passed in)
+/// and the BLAKE3-32 of the pack bytes as the parameters; the contract's
+/// `validate_state` enforces `BLAKE3(state) == parameters` so any peer
+/// can verify content addressing without a signature.
+pub async fn put_pack(
+    web_api: &mut WebApi,
+    pack_wasm: Vec<u8>,
+    pack_bytes: Vec<u8>,
+    timeout: Duration,
+) -> Result<ContractKey> {
+    let pack_hash = *blake3::hash(&pack_bytes).as_bytes();
+    put_contract(web_api, pack_wasm, pack_hash.to_vec(), pack_bytes, timeout).await
+}
+
+/// GET a pack contract's bytes by computing its instance id from the
+/// pack-contract WASM and the pack hash.
+pub async fn get_pack(
+    web_api: &mut WebApi,
+    pack_wasm: &[u8],
+    pack_hash: [u8; 32],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let parameters = Parameters::from(pack_hash.to_vec());
+    let code = ContractCode::from(pack_wasm.to_vec());
+    let key = ContractKey::from_params_and_code(parameters, &code);
+    get_state(web_api, *key.id(), false, timeout).await
+}

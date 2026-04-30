@@ -7,6 +7,7 @@ members = [
     "crates/pack-contract",
     "crates/repo-contract",
     "crates/freenet-git",
+    "crates/git-remote-freenet",
 ]
 
 [workspace.package]

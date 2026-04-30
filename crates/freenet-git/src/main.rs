@@ -96,8 +96,10 @@ enum Cmd {
         /// previews or for hand-off to `fdev publish`.
         #[arg(long, conflicts_with = "publish_to")]
         no_publish: bool,
-        /// Override the default 60-second confirmation timeout.
-        #[arg(long, default_value = "60")]
+        /// Override the default 180-second confirmation timeout. First-PUT
+        /// against a busy gateway can take ~60s for the host to relay the
+        /// confirmation; 180s gives 3x headroom.
+        #[arg(long, default_value = "180")]
         publish_timeout_secs: u64,
     },
 }
@@ -235,12 +237,14 @@ fn create_repo(
     let contract_id = repo_contract_id(&repo_wasm, &params);
     let repo_url = url::format(&contract_id);
 
+    let git_url = url::format_git_url(&contract_id);
     println!("Repo prepared:");
     println!("  Name:        {name}");
     println!("  Description: {description}");
     println!("  Default ref: {default_branch}");
     println!("  Owner:       {}", bundle.id_string());
     println!("  URL:         {repo_url}");
+    println!("  git URL:     {git_url}");
     println!();
     println!(
         "Initial signed state size: {} bytes",
