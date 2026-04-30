@@ -1,0 +1,27 @@
+[package]
+name = "freenet-git-repo-contract"
+description = "Mutable repo state contract for freenet-git: refs and bundle index, owner-signed (Phase 1.0)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+freenet-git-types = { workspace = true }
+freenet-stdlib = { workspace = true, features = ["contract"] }
+bincode.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[dev-dependencies]
+freenet-git-types = { workspace = true, features = ["signing"] }
+ed25519-dalek = { workspace = true }
+bincode = { workspace = true }

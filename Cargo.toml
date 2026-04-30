@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/encoding",
     "crates/types",
+    "crates/pack-contract",
+    "crates/repo-contract",
 ]
 
 [workspace.package]

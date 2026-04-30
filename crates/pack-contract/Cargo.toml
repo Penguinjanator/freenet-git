@@ -1,0 +1,21 @@
+[package]
+name = "freenet-git-pack-contract"
+description = "Immutable packfile contract for freenet-git: state hash equals contract key"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+freenet-stdlib = { workspace = true, features = ["contract"] }
+blake3.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
