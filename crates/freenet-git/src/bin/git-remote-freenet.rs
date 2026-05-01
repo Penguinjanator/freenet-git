@@ -244,12 +244,72 @@ impl HelperEnv {
     }
 }
 
+/// GET the repo state, falling back through legacy contract hashes
+/// if the current key returns nothing. When a legacy hit triggers a
+/// migration, re-PUT the state to the current key (permissionless,
+/// since the state is signed) so subsequent clients see it directly.
+async fn fetch_repo_state(
+    env: &HelperEnv,
+    api: &mut freenet_stdlib::client_api::WebApi,
+    repo_wasm: &[u8],
+) -> Result<RepoState> {
+    use freenet_git_cli::wsclient::{GetSource, LegacyAwareGet};
+
+    let params = freenet_git_types::RepoParams {
+        prefix: env.prefix.clone(),
+    };
+    let params_bytes = params.to_bytes();
+    let legacy_hashes: Vec<&[u8; 32]> = freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES
+        .iter()
+        .map(|(h, _)| *h)
+        .collect();
+
+    let LegacyAwareGet { state, source } = wsclient::get_state_with_legacy_fallback(
+        api,
+        env.contract_id,
+        &params_bytes,
+        &legacy_hashes,
+        ws_timeout(),
+    )
+    .await?;
+
+    if let GetSource::Legacy { index, instance } = source {
+        let (_, desc) = freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES[index];
+        eprintln!(
+            "info: state found at legacy contract {instance} ({desc}); migrating to current key",
+        );
+        // Re-PUT to current key. We send the same state bytes — the
+        // current contract's validate_state must accept them; if it
+        // doesn't, the contract has a backwards-incompatible change
+        // that needs a different migration strategy. We log and
+        // continue in that case so the user can still read the
+        // legacy state via the fallback path.
+        match wsclient::put_contract(
+            api,
+            repo_wasm.to_vec(),
+            params_bytes.clone(),
+            state.clone(),
+            ws_timeout(),
+        )
+        .await
+        {
+            Ok(_) => eprintln!("info: legacy state migrated to current contract key"),
+            Err(e) => eprintln!(
+                "warning: legacy state could not be migrated to current key: {e}; \
+                 still serving from legacy"
+            ),
+        }
+    }
+
+    Ok(RepoState::from_bytes(&state)?)
+}
+
 fn handle_list<W: Write>(env: &HelperEnv, out: &mut W) -> Result<()> {
     let runtime = build_runtime()?;
+    let repo_wasm = load_repo_wasm(env)?;
     let state = runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
-        let bytes = wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
-        Ok::<_, anyhow::Error>(RepoState::from_bytes(&bytes)?)
+        fetch_repo_state(env, &mut api, &repo_wasm).await
     })?;
 
     // Emit refs.
@@ -268,14 +328,13 @@ fn handle_list<W: Write>(env: &HelperEnv, out: &mut W) -> Result<()> {
 
 fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut W) -> Result<()> {
     let pack_wasm = load_pack_wasm(env)?;
+    let repo_wasm = load_repo_wasm(env)?;
 
     let runtime = build_runtime()?;
     runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
 
-        let state_bytes =
-            wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
-        let state = RepoState::from_bytes(&state_bytes)?;
+        let state = fetch_repo_state(env, &mut api, &repo_wasm).await?;
 
         let pack_dir = env.git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
@@ -376,7 +435,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         );
     }
 
-    let _repo_wasm = load_repo_wasm(env)?;
+    let repo_wasm = load_repo_wasm(env)?;
     let pack_wasm = load_pack_wasm(env)?;
 
     // Decrypt identity once (asks for the passphrase via FREENET_GIT_PASSPHRASE
@@ -424,9 +483,10 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
     let result = runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
 
-        let state_bytes =
-            wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
-        let state = RepoState::from_bytes(&state_bytes)?;
+        // Use the legacy-aware fetch so push-from-old-version flows
+        // discover the migrated state and don't try to push a fresh
+        // ref-update onto an empty current contract.
+        let state = fetch_repo_state(env, &mut api, &repo_wasm).await?;
 
         let params = freenet_git_types::RepoParams {
             prefix: env.prefix.clone(),

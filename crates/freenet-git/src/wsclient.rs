@@ -125,6 +125,105 @@ pub fn instance_id(key: &ContractKey) -> ContractInstanceId {
     *key.id()
 }
 
+/// Compute a contract instance id from a precomputed WASM hash and
+/// parameters bytes, without needing the full WASM. Used for the
+/// legacy-contract probe path during migration: we don't ship the old
+/// WASM bytes (just their hashes), but we can still derive what the
+/// old contract key would have been for the same prefix.
+///
+/// This duplicates the derivation `freenet_stdlib` does internally
+/// (`BLAKE3(BLAKE3(code) || params)`) but skips the
+/// `BLAKE3(code)` step since we already have it.
+pub fn contract_id_from_wasm_hash(wasm_hash: &[u8; 32], params_bytes: &[u8]) -> ContractInstanceId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(wasm_hash);
+    hasher.update(params_bytes);
+    let full = hasher.finalize();
+    let mut spec = [0u8; 32];
+    spec.copy_from_slice(full.as_bytes());
+    ContractInstanceId::new(spec)
+}
+
+/// GET the repo state at `current_id`; if not found, walk
+/// `legacy_wasm_hashes`, computing the legacy contract key for the
+/// same `params_bytes` and probing each. Returns the first state we
+/// can find, plus an indicator of whether it came from a legacy key
+/// (so the caller can re-PUT it to the current key for migration).
+///
+/// `timeout` is per-probe, not total — a long list of legacy hashes
+/// can take O(N × timeout) in the worst case.
+pub async fn get_state_with_legacy_fallback(
+    web_api: &mut WebApi,
+    current_id: ContractInstanceId,
+    params_bytes: &[u8],
+    legacy_wasm_hashes: &[&[u8; 32]],
+    timeout: Duration,
+) -> Result<LegacyAwareGet> {
+    // Fast path: try the current key first.
+    match get_state(web_api, current_id, false, timeout).await {
+        Ok(state) if !state.is_empty() => {
+            return Ok(LegacyAwareGet {
+                state,
+                source: GetSource::Current,
+            });
+        }
+        Ok(_) => {
+            // Empty state: treat as "not found" for migration purposes.
+        }
+        Err(e) => {
+            // Network error or contract not found. Don't propagate yet
+            // -- legacy probes might find data.
+            tracing::debug!("current-key GET failed: {e}; trying legacy fallback");
+        }
+    }
+
+    // Legacy probes.
+    for (idx, legacy_hash) in legacy_wasm_hashes.iter().enumerate() {
+        let legacy_id = contract_id_from_wasm_hash(legacy_hash, params_bytes);
+        match get_state(web_api, legacy_id, false, timeout).await {
+            Ok(state) if !state.is_empty() => {
+                return Ok(LegacyAwareGet {
+                    state,
+                    source: GetSource::Legacy {
+                        index: idx,
+                        instance: legacy_id,
+                    },
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("legacy probe {idx} failed: {e}");
+            }
+        }
+    }
+
+    bail!(
+        "no state found at current contract key or any of {} legacy keys",
+        legacy_wasm_hashes.len()
+    );
+}
+
+/// Result of [`get_state_with_legacy_fallback`].
+pub struct LegacyAwareGet {
+    /// The retrieved state bytes.
+    pub state: Vec<u8>,
+    /// Where the state came from.
+    pub source: GetSource,
+}
+
+/// Where a [`get_state_with_legacy_fallback`] result came from.
+pub enum GetSource {
+    /// The current contract key.
+    Current,
+    /// A legacy contract key, indexed into `legacy_wasm_hashes`.
+    Legacy {
+        /// Index in the legacy hash array.
+        index: usize,
+        /// The legacy contract instance id (so the caller can log it).
+        instance: ContractInstanceId,
+    },
+}
+
 /// GET the current state of a contract by its instance id. Returns the
 /// raw state bytes — caller decodes (e.g. via `RepoState::from_bytes`).
 ///
@@ -331,4 +430,27 @@ fn hex_lower(b: &[u8]) -> String {
         let _ = write!(s, "{byte:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_stdlib::prelude::{ContractCode, Parameters};
+
+    /// `contract_id_from_wasm_hash` must produce exactly the same id
+    /// as `ContractInstanceId::from_params_and_code` would, given the
+    /// matching WASM bytes whose BLAKE3 we're shortcutting.
+    #[test]
+    fn legacy_id_derivation_matches_full_derivation() {
+        let fake_wasm: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+        let wasm_hash = *blake3::hash(&fake_wasm).as_bytes();
+        let params_bytes: Vec<u8> = b"test-params".to_vec();
+
+        let full = ContractInstanceId::from_params_and_code(
+            Parameters::from(params_bytes.clone()),
+            ContractCode::from(fake_wasm),
+        );
+        let shortcut = contract_id_from_wasm_hash(&wasm_hash, &params_bytes);
+        assert_eq!(full, shortcut);
+    }
 }
