@@ -6,49 +6,6 @@ commands, without GitHub, GitLab, federation, or a server you operate.
 A repository is a Freenet contract; Git sees it through a standard
 remote helper.
 
-## Status
-
-Experimental. Phase 1 of the design tracked in
-[freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
-
-Working today:
-
-- create a Freenet-hosted Git repository
-- push commits (single pack and multi-chunk)
-- fetch and clone through Git's remote-helper protocol
-- clone live demo repos from the public Freenet network
-- `freenet-git rescue <url>` to re-PUT a repo's bundles when chunks
-  evict from the wider network (cures `exhausted all peers` errors)
-
-Not yet supported:
-
-- **Multi-writer ACL.** Today only the repo owner can push directly.
-  This is closer to Git's original Linus-kernel model: every
-  contributor publishes their own Freenet-hosted clone, maintainers
-  pull from them. ACL (Phase 1.1) is for people who prefer the
-  GitHub-style "everyone pushes to one canonical repo" workflow.
-- **Pull requests** as proposal contracts with signed comments and
-  reviews (Phase 2).
-- **Issues** as per-repo append-only contracts with signed status
-  changes and labels (Phase 4+).
-- **CI / GitHub Actions equivalent.** The hard part isn't running
-  the jobs (anyone can run their own runner). The forge-shaped
-  problem is *coordinating* runner queues, posting signed results,
-  and giving viewers a way to verify "this commit's tests passed."
-  freenet-git will provide the coordination contracts (job queue,
-  result attestations); the runners themselves are out-of-process
-  workers users opt into running. Runner trust models, ranging from
-  N-of-M reproducible-build agreement to TEE attestation to simple
-  whitelisted runners, are sketched in
-  [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
-- **Releases / package registry, discovery via search and
-  reputation** (Phase 4+). Discovery is not a first-come-first-served
-  namespace; it's a search engine over published repos plus a
-  reputation signal so people can tell which `freenet-core` is
-  the one they want.
-- **Parallel chunk uploads.** Pushing repos with hundreds of chunks
-  is currently slow (filed; not yet shipped).
-
 ## Live demos
 
 Hosted on Freenet and clonable today:
@@ -150,7 +107,7 @@ freenet-hosted clone, and maintainers pull from those clones to
 review and merge. There is no shared "canonical repo with everyone
 pushing to it" yet (that's Phase 1.1).
 
-A concrete walkthrough. Alice has a fix she wants Ian to consider
+A concrete walkthrough. Alice has a fix she wants Bob to consider
 for `freenet-core`:
 
 **On Alice's machine:**
@@ -174,12 +131,12 @@ export FREENET_GIT_PASSPHRASE='whatever'
 git push freenet fix-thing
 ```
 
-She then tells Ian her URL through some other channel (Matrix,
+She then tells Bob her URL through some other channel (Matrix,
 email, mailing list, IRC). There is no inbox of incoming proposals
 on Freenet itself yet, so the announce-your-fork step is still
 out-of-band.
 
-**On Ian's machine:**
+**On Bob's machine:**
 
 ```sh
 cd ~/code/freenet-core
@@ -205,8 +162,8 @@ The same pattern with the missing pieces filled in:
   will coexist; pick whichever fits the project's culture.
 - **Phase 2, proposal contracts.** Alice's `git push` of a feature
   branch optionally publishes a signed "PR" document (commit range,
-  description, base ref) to a proposals contract Ian's repo
-  subscribes to. Ian's local UI sees incoming PRs without anyone
+  description, base ref) to a proposals contract Bob's repo
+  subscribes to. Bob's local UI sees incoming PRs without anyone
   having to send a Matrix message. Comments and reviews are signed
   follow-up entries on the same proposal. Cross-repo references
   ("Alice's fix-thing on top of upstream's main@abc1234") become
@@ -326,6 +283,49 @@ key does not compromise your cross-repo identity:
 - Bundles are passphrase-encrypted with `scrypt` + ChaCha20-Poly1305.
   Move them between machines via `freenet-git export-identity` and
   `freenet-git import-identity`.
+
+## Status
+
+Experimental. Phase 1 of the design tracked in
+[freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
+
+Working today:
+
+- create a Freenet-hosted Git repository
+- push commits (single pack and multi-chunk)
+- fetch and clone through Git's remote-helper protocol
+- clone live demo repos from the public Freenet network
+- `freenet-git rescue <url>` to re-PUT a repo's bundles when chunks
+  evict from the wider network (cures `exhausted all peers` errors)
+
+Not yet supported:
+
+- **Multi-writer ACL.** Today only the repo owner can push directly.
+  This is closer to Git's original Linus-kernel model: every
+  contributor publishes their own Freenet-hosted clone, maintainers
+  pull from them. ACL (Phase 1.1) is for people who prefer the
+  GitHub-style "everyone pushes to one canonical repo" workflow.
+- **Pull requests** as proposal contracts with signed comments and
+  reviews (Phase 2).
+- **Issues** as per-repo append-only contracts with signed status
+  changes and labels (Phase 4+).
+- **CI / GitHub Actions equivalent.** The hard part isn't running
+  the jobs (anyone can run their own runner). The forge-shaped
+  problem is *coordinating* runner queues, posting signed results,
+  and giving viewers a way to verify "this commit's tests passed."
+  freenet-git will provide the coordination contracts (job queue,
+  result attestations); the runners themselves are out-of-process
+  workers users opt into running. Runner trust models, ranging from
+  N-of-M reproducible-build agreement to TEE attestation to simple
+  whitelisted runners, are sketched in
+  [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
+- **Releases / package registry, discovery via search and
+  reputation** (Phase 4+). Discovery is not a first-come-first-served
+  namespace; it's a search engine over published repos plus a
+  reputation signal so people can tell which `freenet-core` is
+  the one they want.
+- **Parallel chunk uploads.** Pushing repos with hundreds of chunks
+  is currently slow (filed; not yet shipped).
 
 ## Roadmap
 
