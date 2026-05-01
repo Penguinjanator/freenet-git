@@ -317,6 +317,15 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     Ok(())
 }
 
+/// Returns true if the local git repo is a shallow clone. A shallow
+/// repo has a `.git/shallow` file listing the boundary commits whose
+/// parents are absent from the local object DB. Pushing from a shallow
+/// repo produces packs that fail to clone on the receiver, so we
+/// reject up front.
+fn is_shallow_repo(git_dir: &std::path::Path) -> Result<bool> {
+    Ok(git_dir.join("shallow").exists())
+}
+
 fn install_pack(git_dir: &std::path::Path, pack_bytes: &[u8]) -> Result<()> {
     // Hand the pack to git index-pack via stdin so it computes the
     // index and renames the files into place atomically.
@@ -343,6 +352,30 @@ fn install_pack(git_dir: &std::path::Path, pack_bytes: &[u8]) -> Result<()> {
 }
 
 fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Result<()> {
+    // Refuse to push from a shallow clone. A shallow source's HEAD
+    // commit references a parent SHA that is NOT in the local object
+    // DB; `git pack-objects` happily packs the commit (without the
+    // missing parent), and the receiver fails with `Failed to traverse
+    // parents of commit <sha>` during `git clone`. Surface this up
+    // front with a clear remediation, rather than letting the user
+    // discover it on the other end.
+    if is_shallow_repo(&env.git_dir)? {
+        bail!(
+            "the local repo is a shallow clone (`.git/shallow` exists), so a \
+             push from it would produce a pack referencing parent commits the \
+             receiver cannot resolve.\n\n\
+             Two ways to fix this:\n\n\
+             1. Unshallow first (downloads full history):\n\
+                  git fetch --unshallow\n\n\
+             2. Push an orphan snapshot (no history, current source only):\n\
+                  mkdir /tmp/snap && cd /tmp/snap && git init -b main\n\
+                  cp -a $OLDPWD/. .\n\
+                  git add . && git commit -m \"snapshot\"\n\
+                  git remote add freenet <your-freenet-url>\n\
+                  git push freenet main\n"
+        );
+    }
+
     let _repo_wasm = load_repo_wasm(env)?;
     let pack_wasm = load_pack_wasm(env)?;
 
