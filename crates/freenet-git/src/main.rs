@@ -25,7 +25,7 @@ use freenet_git_cli::state_init::initial_repo_state;
 use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{
-    default_bundle_path, read_bundle, seal, write_bundle, DecryptedBundle, RepoRegistryEntry,
+    default_bundle_path, read_bundle, write_bundle, DecryptedBundle, RepoRegistryEntry,
 };
 use freenet_git_types::{limits, pubkey_prefix, RepoParams};
 use rand::rngs::OsRng;
@@ -189,11 +189,11 @@ fn whoami(path: &std::path::Path) -> Result<()> {
 fn export_identity(path: &std::path::Path, out: &std::path::Path) -> Result<()> {
     let bundle = open_bundle_with_prompt(path)?;
     let pw = prompt_passphrase_with_confirm("Passphrase for exported bundle")?;
-    let bytes = seal(&bundle, &pw)?;
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(out, bytes)?;
+    // Use write_bundle to get atomic-rename + 0600 permissions on Unix.
+    // Plain `std::fs::write` would leave the bundle world-readable
+    // depending on the user's umask.
+    write_bundle(&bundle, &pw, out)
+        .with_context(|| format!("write exported bundle to {}", out.display()))?;
     println!("Wrote bundle to {}", out.display());
     Ok(())
 }
