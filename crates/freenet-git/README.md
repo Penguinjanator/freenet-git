@@ -138,6 +138,35 @@ This is a Phase 1 UX compromise. Avoid putting the passphrase in
 shell history or long-lived environment files. A future release will
 add OS-keychain integration.
 
+## Keeping a published repo alive
+
+Freenet is a communication medium, not a storage medium. Contracts
+that nobody is actively reading get evicted from peers over time
+to make room for hotter content. For a freenet-git repo this shows
+up as:
+
+```
+error: fetch ChunkedPack ...
+Caused by: get exhausted all peers after 4 attempts
+```
+
+The fix is to refresh the network's hot copy. Anyone with a node
+that still has the contract data cached (typically the original
+publisher) can run:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label>
+```
+
+This re-PUTs every bundle and chunk the repo references, which
+re-broadcasts each to ~50 fresh peers and resets the eviction clock.
+
+For repos you publish and want to keep reachable, run rescue as a
+cron job (e.g. once a day or a few times a week) from a node that
+holds the data. A future release will add `freenet-git rescue --from
+<git-dir>` so any clone-holder can rescue from their working tree
+even if the local node's cache has also forgotten.
+
 ## How URLs work
 
 A freenet-git URL looks like:
