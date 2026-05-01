@@ -138,6 +138,91 @@ This is a Phase 1 UX compromise. Avoid putting the passphrase in
 shell history or long-lived environment files. A future release will
 add OS-keychain integration.
 
+## Sending changes to a maintainer
+
+Today freenet-git works the way Linux kernel development worked
+before centralized forges: each contributor publishes their own
+freenet-hosted clone, and maintainers pull from those clones to
+review and merge. There is no shared "canonical repo with everyone
+pushing to it" yet (that's Phase 1.1).
+
+A concrete walkthrough. Alice has a fix she wants Ian to consider
+for `freenet-core`:
+
+**On Alice's machine:**
+
+```sh
+# one-time setup
+cargo install freenet-git
+freenet-git init-identity --name "Alice" --email alice@example.com
+
+# Alice already has a clone of freenet-core somewhere
+cd ~/code/freenet-core
+git checkout -b fix-thing
+# ... commits ...
+
+# publish her fork as a freenet-hosted repo
+freenet-git create --name freenet-core-alice
+# -> URL: freenet:Aa12bc34De56/freenet-core-alice
+
+git remote add freenet freenet::Aa12bc34De56/freenet-core-alice
+export FREENET_GIT_PASSPHRASE='whatever'
+git push freenet fix-thing
+```
+
+She then tells Ian her URL through some other channel (Matrix,
+email, mailing list, IRC). There is no inbox of incoming proposals
+on Freenet itself yet, so the announce-your-fork step is still
+out-of-band.
+
+**On Ian's machine:**
+
+```sh
+cd ~/code/freenet-core
+git remote add alice freenet::Aa12bc34De56/freenet-core-alice
+git fetch alice                            # streams from Freenet
+git log alice/fix-thing --oneline -5       # review
+git checkout -b alice-fix alice/fix-thing
+cargo test
+# if happy:
+git checkout main && git merge alice-fix
+```
+
+Mechanically the round trip works end-to-end on the network today.
+What's missing is the social layer.
+
+### Where this is heading
+
+The same pattern with the missing pieces filled in:
+
+- **Phase 1.1, multi-writer ACL.** For projects that prefer the
+  GitHub-style "everyone pushes to one canonical repo" workflow,
+  the repo owner publishes a signed contributor list. Both modes
+  will coexist; pick whichever fits the project's culture.
+- **Phase 2, proposal contracts.** Alice's `git push` of a feature
+  branch optionally publishes a signed "PR" document (commit range,
+  description, base ref) to a proposals contract Ian's repo
+  subscribes to. Ian's local UI sees incoming PRs without anyone
+  having to send a Matrix message. Comments and reviews are signed
+  follow-up entries on the same proposal. Cross-repo references
+  ("Alice's fix-thing on top of upstream's main@abc1234") become
+  first-class.
+- **Phase 3, signed CI attestations.** Anyone can run a runner;
+  results are signed and posted to a job-queue contract. Viewers
+  verify "this commit's tests passed" against whatever trust model
+  the project picked (whitelisted runners, N-of-M reproducible
+  build agreement, TEE attestation).
+- **Phase 4+, issues, releases, human-readable names.** Issues as
+  per-repo append-only signed timelines. Releases as signed tag
+  refs plus artifact contracts. A Freenet-native ENS-style layer so
+  Ian can hand someone `freenet:freenet-core` instead of the
+  base58-prefixed form.
+
+Until those phases land, the `git remote add` / `git fetch` /
+out-of-band-tell-the-maintainer loop above is the supported flow.
+It is enough for the substrate to be useful; the forge layers on
+top.
+
 ## Keeping a published repo alive
 
 Freenet is a communication medium, not a storage medium. Peers
