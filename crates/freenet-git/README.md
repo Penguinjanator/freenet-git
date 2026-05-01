@@ -2,13 +2,13 @@
 
 Git repositories hosted directly on [Freenet](https://freenet.org).
 Push, fetch, and clone through the Freenet network using normal Git
-commands — without GitHub, GitLab, federation, or a server you
-operate. A repository is a Freenet contract; Git sees it through a
-standard remote helper.
+commands, without GitHub, GitLab, federation, or a server you operate.
+A repository is a Freenet contract; Git sees it through a standard
+remote helper.
 
 ## Status
 
-Experimental — Phase 1 of the design tracked in
+Experimental. Phase 1 of the design tracked in
 [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
 
 Working today:
@@ -21,30 +21,29 @@ Working today:
 Not yet supported:
 
 - **Multi-writer ACL.** Today only the repo owner can push directly.
-  This is closer to Git's original Linus-kernel model — every
-  contributor publishes their own Freenet-hosted clone, and
-  maintainers pull from them. ACL (Phase 1.1) is for people who
-  prefer the GitHub-style "everyone pushes to one canonical repo"
-  workflow.
+  This is closer to Git's original Linus-kernel model: every
+  contributor publishes their own Freenet-hosted clone, maintainers
+  pull from them. ACL (Phase 1.1) is for people who prefer the
+  GitHub-style "everyone pushes to one canonical repo" workflow.
 - **Pull requests** as proposal contracts with signed comments and
   reviews (Phase 2).
 - **Issues** as per-repo append-only contracts with signed status
   changes and labels (Phase 4+).
 - **CI / GitHub Actions equivalent.** The hard part isn't running
-  the jobs — anyone can run their own runner. The forge-shaped
+  the jobs (anyone can run their own runner). The forge-shaped
   problem is *coordinating* runner queues, posting signed results,
   and giving viewers a way to verify "this commit's tests passed."
   freenet-git will provide the coordination contracts (job queue,
   result attestations); the runners themselves are out-of-process
-  workers users opt into running. Runner trust models — N-of-M
-  reproducible-build agreement, TEE attestation, or simple
-  whitelisted runners — sketched in
+  workers users opt into running. Runner trust models, ranging from
+  N-of-M reproducible-build agreement to TEE attestation to simple
+  whitelisted runners, are sketched in
   [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
 - **Releases / package registry, human-readable names** (Phase 4+).
 - **Self-healing `freenet-git rescue` command** for re-PUTting bytes
   the network has forgotten (filed; not yet shipped).
-- **Parallel chunk uploads** — pushing repos with hundreds of
-  chunks is currently slow (filed; not yet shipped).
+- **Parallel chunk uploads.** Pushing repos with hundreds of chunks
+  is currently slow (filed; not yet shipped).
 
 ## Live demos
 
@@ -98,7 +97,7 @@ This installs both `freenet-git` (the companion CLI) and
 ### 2. Run a local Freenet node
 
 You need a Freenet node running locally to talk to. See the
-[Freenet getting-started guide](https://docs.freenet.org/) — the
+[Freenet getting-started guide](https://docs.freenet.org/). The
 WebSocket API endpoint defaults to
 `ws://127.0.0.1:50509/v1/contract/command`.
 
@@ -108,8 +107,8 @@ WebSocket API endpoint defaults to
 git clone freenet::2pyvKxrozxgT/freenet-stdlib
 ```
 
-That's the lowest-friction first success: no identity, no setup,
-just `git clone` against a real Freenet-hosted repository.
+No identity, no setup. Just `git clone` against a real
+Freenet-hosted repository.
 
 ### 4. Publish your own repo
 
@@ -136,8 +135,8 @@ passphrase interactively. For now you must provide it via
 `FREENET_GIT_PASSPHRASE`.
 
 This is a Phase 1 UX compromise. Avoid putting the passphrase in
-shell history or long-lived environment files. A future release
-will add OS-keychain integration.
+shell history or long-lived environment files. A future release will
+add OS-keychain integration.
 
 ## How URLs work
 
@@ -169,7 +168,7 @@ contract key is computed locally as
 
 Anyone with a current `freenet-git` install resolves the same
 contract key from the same prefix. The URL stays stable across
-contract WASM upgrades — only the underlying contract key changes,
+contract WASM upgrades; only the underlying contract key changes,
 which the on-host helper handles transparently.
 
 ### Label
@@ -188,19 +187,18 @@ It's purely cosmetic:
 
 Today, only the repo owner can push to a given Freenet repo. Other
 developers publish their own Freenet-hosted clones and maintainers
-pull from them — the same workflow that built the Linux kernel
-before centralized forges became dominant. This isn't a missing
-feature; it's a design fit with Git's actual architecture.
+pull from them. This is the same workflow that built the Linux
+kernel before centralized forges became dominant.
 
-Phase 1.1 adds opt-in multi-writer ACL for projects that prefer
-the GitHub-style "everyone pushes to one canonical repo" model.
-Both modes will coexist.
+Phase 1.1 adds opt-in multi-writer ACL for projects that prefer the
+GitHub-style "everyone pushes to one canonical repo" model. Both
+modes will coexist.
 
 Each repo has its own ed25519 keypair, so compromising one repo's
 key does not compromise your cross-repo identity:
 
 - `freenet-git init-identity` creates a default identity (used for
-  cross-repo signing in Phase 2 — PR comments and reviews).
+  cross-repo signing in Phase 2: PR comments and reviews).
 - `freenet-git create` generates a fresh per-repo keypair and stores
   it in your bundle's `repos` registry. The URL prefix is derived
   from this per-repo public key.
@@ -210,19 +208,18 @@ key does not compromise your cross-repo identity:
 
 ## Roadmap
 
-The goal is not just "Git transport over Freenet"; it is a
-decentralized software forge, built incrementally:
+The goal is a decentralized software forge, built incrementally:
 
 - **Phase 1.0 (current):** single-writer push/fetch/clone (the
   Linus-kernel model).
 - **Phase 1.1:** opt-in multi-writer ACL for projects that want a
   GitHub-style canonical repo with shared write access.
 - **Phase 2:** pull requests as proposal contracts; signed comments
-  and reviews; cross-repo references (your fork → maintainer's
+  and reviews; cross-repo references (your fork to maintainer's
   upstream).
-- **Phase 3:** CI coordination — job-queue contracts, signed
-  result attestations. Runners are out-of-process workers that
-  users opt into running; trust model can range from a simple
+- **Phase 3:** CI coordination. Job-queue contracts, signed result
+  attestations. Runners are out-of-process workers that users opt
+  into running; trust model can range from a simple
   maintainer-whitelist to N-of-M reproducible-build agreement to
   TEE attestation.
 - **Phase 4+:** issues (per-repo append-only signed timelines),
