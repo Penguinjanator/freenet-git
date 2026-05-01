@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod chunked;
 pub mod ids;
 pub mod state_init;
 pub mod url;

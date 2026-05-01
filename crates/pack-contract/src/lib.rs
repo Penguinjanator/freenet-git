@@ -62,15 +62,55 @@ impl ContractInterface for Contract {
         }
     }
 
-    /// Pack contracts are immutable. Any attempt to update is an error.
+    /// Pack contracts are content-addressed: the only legitimate state
+    /// is the unique blob whose `BLAKE3-32` equals `parameters`. Accept
+    /// any update whose new state passes that check (a no-op, since
+    /// the host is delivering the same canonical bytes the contract
+    /// already has). Reject everything else.
+    ///
+    /// Why we accept rather than reject identical re-PUTs: when the
+    /// network already hosts the contract and a peer issues another
+    /// PUT for the same content, the host routes it as an update to
+    /// the existing contract, not as a fresh insertion. Rejecting all
+    /// updates breaks legitimate re-PUTs (e.g. `freenet-git rescue`,
+    /// or a second client publishing the same chunk concurrently).
     fn update_state(
-        _parameters: Parameters<'static>,
-        _state: State<'static>,
-        _data: alloc::vec::Vec<UpdateData<'static>>,
+        parameters: Parameters<'static>,
+        state: State<'static>,
+        data: alloc::vec::Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        Err(ContractError::InvalidUpdateWithInfo {
-            reason: alloc::string::String::from("pack contracts are immutable"),
-        })
+        // The host expects update_state to return the (possibly
+        // unchanged) merged state. For pack contracts there is at
+        // most one valid state, so we can validate any candidate the
+        // host hands us and return whichever one we believe.
+        let mut current = state;
+        for update in data {
+            match update {
+                UpdateData::State(new_state) => {
+                    Self::validate_state(
+                        parameters.clone(),
+                        new_state.clone(),
+                        RelatedContracts::default(),
+                    )?;
+                    current = new_state;
+                }
+                UpdateData::Delta(_)
+                | UpdateData::StateAndDelta { .. }
+                | UpdateData::RelatedState { .. }
+                | UpdateData::RelatedDelta { .. }
+                | UpdateData::RelatedStateAndDelta { .. } => {
+                    return Err(ContractError::InvalidUpdateWithInfo {
+                        reason: alloc::string::String::from(
+                            "pack contracts only accept full-state updates",
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(ContractError::InvalidUpdate);
+                }
+            }
+        }
+        Ok(UpdateModification::valid(current))
     }
 
     /// The summary of a pack is its hash. Two peers comparing summaries can
@@ -129,10 +169,39 @@ mod tests {
     }
 
     #[test]
-    fn updates_are_rejected() {
+    fn update_with_correct_state_is_accepted() {
+        let payload = b"hello pack";
+        let hash = blake3::hash(payload);
+        let parameters = Parameters::from(hash.as_bytes().to_vec());
+        let state = State::from(payload.to_vec());
+        let result = Contract::update_state(
+            parameters.clone(),
+            state.clone(),
+            vec![UpdateData::State(state.clone())],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_with_wrong_state_is_rejected() {
+        let payload = b"hello pack";
+        let hash = blake3::hash(payload);
+        let parameters = Parameters::from(hash.as_bytes().to_vec());
+        let state = State::from(payload.to_vec());
+        let bad_state = State::from(b"different bytes".to_vec());
+        let result = Contract::update_state(parameters, state, vec![UpdateData::State(bad_state)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_with_delta_is_rejected() {
         let parameters = Parameters::from(vec![0u8; 32]);
         let state = State::from(vec![0u8; 32]);
-        let result = Contract::update_state(parameters, state, vec![]);
+        let result = Contract::update_state(
+            parameters,
+            state,
+            vec![UpdateData::Delta(StateDelta::from(vec![1, 2, 3]))],
+        );
         assert!(matches!(
             result,
             Err(ContractError::InvalidUpdateWithInfo { .. })

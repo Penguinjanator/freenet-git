@@ -34,8 +34,28 @@ use freenet_git_types::signing::{sign_bundle_record, sign_ref_entry};
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
 
-/// Default 60s for any single WS round-trip.
-const WS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default per-op WS timeout. The gateway can take ~60s to relay a
+/// PUT confirmation under load (we observed this consistently against
+/// the production gateway during initial dogfooding); 180s gives 3x
+/// headroom. Override with `FREENET_GIT_WS_TIMEOUT_SECS`.
+fn ws_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("FREENET_GIT_WS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(180),
+    )
+}
+
+/// Pack-size threshold above which we split into chunks. Override with
+/// `FREENET_GIT_CHUNK_SIZE` (bytes). Default
+/// [`freenet_git_types::chunked::DEFAULT_CHUNK_SIZE`] (1 MiB).
+fn chunk_size_from_env() -> u32 {
+    std::env::var("FREENET_GIT_CHUNK_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(freenet_git_types::chunked::DEFAULT_CHUNK_SIZE)
+}
 
 fn main() -> ExitCode {
     init_tracing();
@@ -228,7 +248,7 @@ fn handle_list<W: Write>(env: &HelperEnv, out: &mut W) -> Result<()> {
     let runtime = build_runtime()?;
     let state = runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
-        let bytes = wsclient::get_state(&mut api, env.contract_id, false, WS_TIMEOUT).await?;
+        let bytes = wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
         Ok::<_, anyhow::Error>(RepoState::from_bytes(&bytes)?)
     })?;
 
@@ -253,45 +273,37 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
 
-        let state_bytes = wsclient::get_state(&mut api, env.contract_id, false, WS_TIMEOUT).await?;
+        let state_bytes =
+            wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
         let state = RepoState::from_bytes(&state_bytes)?;
-
-        // Phase 1.0: fetch every SinglePack bundle referenced in
-        // object_index. The git index-pack step below will simply ignore
-        // packs that contain no objects we need, so this is correct
-        // (just suboptimal).
-        let mut single_packs: Vec<[u8; 32]> = Vec::new();
-        let mut chunked_skipped = 0usize;
-        for record in state.object_index.values() {
-            match &record.bundle {
-                ObjectBundle::SinglePack { pack_hash, .. } => single_packs.push(*pack_hash),
-                ObjectBundle::ChunkedPack { .. } => chunked_skipped += 1,
-            }
-        }
-        if chunked_skipped > 0 {
-            eprintln!(
-                "warning: {chunked_skipped} ChunkedPack bundle(s) skipped — Phase 1.0 \
-                 git-remote-freenet only consumes SinglePack. Some refs may not be \
-                 fully fetched.",
-            );
-        }
 
         let pack_dir = env.git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        for hash in &single_packs {
-            let pack_bytes = wsclient::get_pack(&mut api, &pack_wasm, *hash, WS_TIMEOUT).await?;
-            // Re-verify content addressing locally — the contract did
-            // it on the network side but we don't trust the path
-            // between here and there.
-            let actual = *blake3::hash(&pack_bytes).as_bytes();
-            if actual != *hash {
-                bail!(
-                    "pack content hash mismatch: got {} expected {}",
-                    hex::encode(actual),
-                    hex::encode(hash),
-                );
-            }
+        // Fetch every bundle in object_index and feed the resulting
+        // pack bytes to `git index-pack`. SinglePack and ChunkedPack
+        // both terminate as "a pack ready for index-pack"; the only
+        // difference is how we get there.
+        for record in state.object_index.values() {
+            let pack_bytes = match &record.bundle {
+                ObjectBundle::SinglePack { pack_hash, .. } => {
+                    wsclient::get_pack(&mut api, &pack_wasm, *pack_hash, ws_timeout()).await?
+                }
+                ObjectBundle::ChunkedPack {
+                    manifest_hash,
+                    total_size,
+                    chunk_count,
+                } => freenet_git_cli::chunked::fetch_chunked_pack(
+                    &mut api,
+                    &pack_wasm,
+                    *manifest_hash,
+                    *total_size,
+                    *chunk_count,
+                    ws_timeout(),
+                )
+                .await
+                .with_context(|| format!("fetch ChunkedPack {}", hex::encode(manifest_hash)))?,
+            };
             install_pack(&env.git_dir, &pack_bytes)?;
         }
 
@@ -374,11 +386,13 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         ed25519_dalek::SigningKey::from_bytes(&bytes)
     };
 
+    let chunk_size = chunk_size_from_env();
     let runtime = build_runtime()?;
     let result = runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
 
-        let state_bytes = wsclient::get_state(&mut api, env.contract_id, false, WS_TIMEOUT).await?;
+        let state_bytes =
+            wsclient::get_state(&mut api, env.contract_id, false, ws_timeout()).await?;
         let state = RepoState::from_bytes(&state_bytes)?;
 
         let params = freenet_git_types::RepoParams {
@@ -409,19 +423,44 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                 }
             };
 
-            // PUT the pack contract.
-            let pack_key =
-                wsclient::put_pack(&mut api, pack_wasm.clone(), pack_bytes.clone(), WS_TIMEOUT)
-                    .await?;
-            let pack_hash = *blake3::hash(&pack_bytes).as_bytes();
-            let pack_id_check = pack_contract_id(&pack_wasm, &pack_bytes);
-            debug_assert_eq!(pack_key.id(), &pack_id_check);
-
-            // Sign the bundle-add record.
-            let bundle_obj = ObjectBundle::SinglePack {
-                pack_hash,
-                size_bytes: pack_bytes.len() as u64,
+            // Decide SinglePack vs ChunkedPack. Rule (per design 0001):
+            //   pack_size <= CHUNK_SIZE  -> SinglePack
+            //   pack_size > CHUNK_SIZE   -> ChunkedPack
+            let bundle_obj = if (pack_bytes.len() as u64) <= chunk_size as u64 {
+                let pack_key = wsclient::put_pack(
+                    &mut api,
+                    pack_wasm.clone(),
+                    pack_bytes.clone(),
+                    ws_timeout(),
+                )
+                .await?;
+                let pack_hash = *blake3::hash(&pack_bytes).as_bytes();
+                let pack_id_check = pack_contract_id(&pack_wasm, &pack_bytes);
+                debug_assert_eq!(pack_key.id(), &pack_id_check);
+                ObjectBundle::SinglePack {
+                    pack_hash,
+                    size_bytes: pack_bytes.len() as u64,
+                }
+            } else {
+                eprintln!(
+                    "info: pack is {} bytes, splitting into chunks of {chunk_size} bytes",
+                    pack_bytes.len()
+                );
+                let published = freenet_git_cli::chunked::publish_chunked_pack(
+                    &mut api,
+                    pack_wasm.clone(),
+                    pack_bytes.clone(),
+                    chunk_size,
+                    ws_timeout(),
+                )
+                .await?;
+                eprintln!(
+                    "info: published ChunkedPack ({} chunks, {} bytes total)",
+                    published.chunk_count, published.total_size,
+                );
+                published.bundle
             };
+
             let bundle_id = bundle_obj.id();
             let record = sign_bundle_record(&params, &signing, bundle_obj, 0);
             delta.object_index.insert(bundle_id, record);
@@ -449,7 +488,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             &mut api,
             env.contract_id,
             bincode::serialize(&delta)?,
-            WS_TIMEOUT,
+            ws_timeout(),
         )
         .await?;
 

@@ -21,6 +21,8 @@
 #[cfg(feature = "signing")]
 pub mod signing;
 
+pub mod chunked;
+
 use std::collections::BTreeMap;
 
 use freenet_git_encoding::canonical::{MapBuilder, Value};

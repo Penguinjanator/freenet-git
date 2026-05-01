@@ -256,18 +256,53 @@ pub async fn update_state(
 /// and the BLAKE3-32 of the pack bytes as the parameters; the contract's
 /// `validate_state` enforces `BLAKE3(state) == parameters` so any peer
 /// can verify content addressing without a signature.
+///
+/// Retries up to 3 times with exponential backoff on transient host
+/// errors. Pack contracts are content-addressed, so retries are
+/// idempotent: a second PUT of the same bytes resolves to the same
+/// contract key, and the contract's `update_state` accepts a no-op
+/// re-PUT of identical canonical bytes.
 pub async fn put_pack(
     web_api: &mut WebApi,
     pack_wasm: Vec<u8>,
     pack_bytes: Vec<u8>,
     timeout: Duration,
 ) -> Result<ContractKey> {
+    const MAX_ATTEMPTS: u32 = 3;
     let pack_hash = *blake3::hash(&pack_bytes).as_bytes();
-    put_contract(web_api, pack_wasm, pack_hash.to_vec(), pack_bytes, timeout).await
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match put_contract(
+            web_api,
+            pack_wasm.clone(),
+            pack_hash.to_vec(),
+            pack_bytes.clone(),
+            timeout,
+        )
+        .await
+        {
+            Ok(key) => return Ok(key),
+            Err(e) => {
+                let msg = format!("{e}");
+                tracing::warn!(
+                    "put_pack attempt {attempt}/{MAX_ATTEMPTS} failed: {msg}; will retry"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    let backoff = Duration::from_secs(2u64.pow(attempt));
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("put_pack failed (no error captured)")))
 }
 
 /// GET a pack contract's bytes by computing its instance id from the
-/// pack-contract WASM and the pack hash.
+/// pack-contract WASM and the pack hash. Verifies content-addressing
+/// (`BLAKE3(returned_bytes) == pack_hash`) before returning so a
+/// pathological host cannot hand us bytes claiming to be a specific
+/// pack.
 pub async fn get_pack(
     web_api: &mut WebApi,
     pack_wasm: &[u8],
@@ -277,5 +312,23 @@ pub async fn get_pack(
     let parameters = Parameters::from(pack_hash.to_vec());
     let code = ContractCode::from(pack_wasm.to_vec());
     let key = ContractKey::from_params_and_code(parameters, &code);
-    get_state(web_api, *key.id(), false, timeout).await
+    let bytes = get_state(web_api, *key.id(), false, timeout).await?;
+    let actual = *blake3::hash(&bytes).as_bytes();
+    if actual != pack_hash {
+        bail!(
+            "pack content hash mismatch: got {} expected {}",
+            hex_lower(&actual),
+            hex_lower(&pack_hash),
+        );
+    }
+    Ok(bytes)
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
 }
