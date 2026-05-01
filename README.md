@@ -1,10 +1,8 @@
 # freenet-git
 
 Git repositories hosted directly on [Freenet](https://freenet.org).
-
-`freenet-git` lets you publish, push, fetch, and clone Git repositories
-through the Freenet network using normal Git commands. There is no
-central Git host, no federation layer, and no server you need to
+Push, fetch, and clone through the Freenet network using normal Git
+commands — without GitHub, GitLab, federation, or a server you
 operate. A repository is a Freenet contract; Git sees it through a
 standard remote helper.
 
@@ -48,10 +46,9 @@ Not yet supported:
 - **Parallel chunk uploads** — pushing repos with hundreds of
   chunks is currently slow (filed; not yet shipped).
 
-## Try a live Freenet-hosted repo
+## Live demos
 
-These are real Freenet contracts, hosted on the network and clonable
-right now:
+Hosted on Freenet and clonable today:
 
 ```sh
 # freenet-core HEAD source snapshot (no full history)
@@ -199,20 +196,17 @@ Phase 1.1 adds opt-in multi-writer ACL for projects that prefer
 the GitHub-style "everyone pushes to one canonical repo" model.
 Both modes will coexist.
 
-Each repo has its own ed25519 keypair, mirroring the
-[delta site](https://github.com/freenet/delta) model (a Freenet
-project that hosts websites the same way):
+Each repo has its own ed25519 keypair, so compromising one repo's
+key does not compromise your cross-repo identity:
 
 - `freenet-git init-identity` creates a default identity (used for
   cross-repo signing in Phase 2 — PR comments and reviews).
-- `freenet-git create` generates a fresh per-repo keypair and
-  stores it in your bundle's `repos` registry. The URL prefix is
-  derived from this per-repo public key.
-- Losing one repo's key compromises only that repo, not your
-  identity.
+- `freenet-git create` generates a fresh per-repo keypair and stores
+  it in your bundle's `repos` registry. The URL prefix is derived
+  from this per-repo public key.
 - Bundles are passphrase-encrypted with `scrypt` + ChaCha20-Poly1305.
-  Move them between machines via `freenet-git export-identity`
-  and `freenet-git import-identity`.
+  Move them between machines via `freenet-git export-identity` and
+  `freenet-git import-identity`.
 
 ## Roadmap
 
