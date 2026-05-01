@@ -22,12 +22,31 @@ Working today:
 
 Not yet supported:
 
-- multi-writer ACL — only the repo owner can push (Phase 1.1)
-- pull requests, issues, CI (Phases 2–4)
-- releases / package registry, human-readable names (Phase 4+)
-- self-healing `freenet-git rescue` command (filed; not yet shipped)
-- parallel chunk uploads — pushing repos with hundreds of chunks is
-  currently slow (filed; not yet shipped)
+- **Multi-writer ACL.** Today only the repo owner can push directly.
+  This is closer to Git's original Linus-kernel model — every
+  contributor publishes their own Freenet-hosted clone, and
+  maintainers pull from them. ACL (Phase 1.1) is for people who
+  prefer the GitHub-style "everyone pushes to one canonical repo"
+  workflow.
+- **Pull requests** as proposal contracts with signed comments and
+  reviews (Phase 2).
+- **Issues** as per-repo append-only contracts with signed status
+  changes and labels (Phase 4+).
+- **CI / GitHub Actions equivalent.** The hard part isn't running
+  the jobs — anyone can run their own runner. The forge-shaped
+  problem is *coordinating* runner queues, posting signed results,
+  and giving viewers a way to verify "this commit's tests passed."
+  freenet-git will provide the coordination contracts (job queue,
+  result attestations); the runners themselves are out-of-process
+  workers users opt into running. Runner trust models — N-of-M
+  reproducible-build agreement, TEE attestation, or simple
+  whitelisted runners — sketched in
+  [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
+- **Releases / package registry, human-readable names** (Phase 4+).
+- **Self-healing `freenet-git rescue` command** for re-PUTting bytes
+  the network has forgotten (filed; not yet shipped).
+- **Parallel chunk uploads** — pushing repos with hundreds of
+  chunks is currently slow (filed; not yet shipped).
 
 ## Try a live Freenet-hosted repo
 
@@ -170,11 +189,15 @@ It's purely cosmetic:
 
 ## Identity model
 
-In Phase 1, only the repo owner can push to a given Freenet repo.
-Other developers can still publish their own Freenet-hosted clones,
-and maintainers can pull from them — the same workflow that built
-the Linux kernel before centralized forges became dominant. Phase
-1.1 will add multi-writer ACL.
+Today, only the repo owner can push to a given Freenet repo. Other
+developers publish their own Freenet-hosted clones and maintainers
+pull from them — the same workflow that built the Linux kernel
+before centralized forges became dominant. This isn't a missing
+feature; it's a design fit with Git's actual architecture.
+
+Phase 1.1 adds opt-in multi-writer ACL for projects that prefer
+the GitHub-style "everyone pushes to one canonical repo" model.
+Both modes will coexist.
 
 Each repo has its own ed25519 keypair, mirroring the
 [delta site](https://github.com/freenet/delta) model (a Freenet
@@ -196,12 +219,22 @@ project that hosts websites the same way):
 The goal is not just "Git transport over Freenet"; it is a
 decentralized software forge, built incrementally:
 
-- **Phase 1.0 (current):** single-writer push/fetch/clone.
-- **Phase 1.1:** multi-writer ACL with epoch model and grant/revoke.
+- **Phase 1.0 (current):** single-writer push/fetch/clone (the
+  Linus-kernel model).
+- **Phase 1.1:** opt-in multi-writer ACL for projects that want a
+  GitHub-style canonical repo with shared write access.
 - **Phase 2:** pull requests as proposal contracts; signed comments
-  and reviews.
-- **Phase 3:** CI with cryptographic attestation.
-- **Phase 4+:** issues, releases, identity, registry, names.
+  and reviews; cross-repo references (your fork → maintainer's
+  upstream).
+- **Phase 3:** CI coordination — job-queue contracts, signed
+  result attestations. Runners are out-of-process workers that
+  users opt into running; trust model can range from a simple
+  maintainer-whitelist to N-of-M reproducible-build agreement to
+  TEE attestation.
+- **Phase 4+:** issues (per-repo append-only signed timelines),
+  releases (signed tag refs + artifact contracts), human-readable
+  names (a Freenet-native ENS-style layer), per-user identity
+  contracts that link to PGP/SSH/GitHub identities for continuity.
 
 See [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985)
 for the design and rationale.
