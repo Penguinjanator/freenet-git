@@ -106,6 +106,29 @@ enum Cmd {
         #[arg(long, default_value = "180")]
         publish_timeout_secs: u64,
     },
+    /// Re-PUT every bundle a repo references, refreshing the network's
+    /// hot copy. Use when chunks have been evicted from the wider
+    /// network (`exhausted all peers` errors during clone).
+    ///
+    /// MVP behaviour: connects to the local Freenet node, GETs each
+    /// bundle (and chunks) via the local node's cache or the network,
+    /// then PUTs each one back. This re-broadcasts to fresh peers and
+    /// resets the eviction clock.
+    ///
+    /// Future versions will reconstruct missing bytes from a local
+    /// clone (`--from <path>`) when the local node's cache no longer
+    /// has them either.
+    Rescue {
+        /// Repo URL, e.g. `freenet:RtTzy58hMxAB/my-project`.
+        url: String,
+        /// WebSocket URL of a local Freenet node. Defaults to the
+        /// standard local endpoint.
+        #[arg(long)]
+        ws_url: Option<String>,
+        /// Override the default 180-second per-operation timeout.
+        #[arg(long, default_value = "180")]
+        timeout_secs: u64,
+    },
 }
 
 fn main() -> ExitCode {
@@ -146,6 +169,11 @@ fn run(cli: Cli) -> Result<()> {
             no_publish,
             Duration::from_secs(publish_timeout_secs),
         ),
+        Cmd::Rescue {
+            url,
+            ws_url,
+            timeout_secs,
+        } => rescue(&url, ws_url.as_deref(), Duration::from_secs(timeout_secs)),
     }
 }
 
@@ -342,6 +370,161 @@ fn register_in_bundle(
 
 fn repo_id_string(pubkey: &[u8]) -> String {
     format!("freenet:id:{}", bs58::encode(pubkey).into_string())
+}
+
+/// Re-PUT every bundle (and chunk) a repo references back to the
+/// network, refreshing the hot copy. The local Freenet node serves
+/// as the byte source: each bundle is GET'd (which pulls from local
+/// cache if hosted, or from the wider network if not), then PUT
+/// back, which triggers a fresh broadcast to ~50 peers.
+fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> {
+    let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
+    let ws = ws_url.unwrap_or(DEFAULT_WS_URL).to_string();
+    println!("Rescuing {} via {ws}", url::format(&parsed.prefix));
+
+    let repo_wasm = freenet_git_cli::REPO_CONTRACT_WASM.to_vec();
+    let pack_wasm = freenet_git_cli::PACK_CONTRACT_WASM.to_vec();
+    let contract_id =
+        freenet_git_cli::ids::repo_contract_id_from_prefix(&repo_wasm, &parsed.prefix);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    runtime.block_on(async {
+        let mut api = wsclient::connect(&ws).await?;
+
+        // Pull the repo state. legacy_aware_get uses fallback so a
+        // post-WASM-bump rescue still finds the predecessor's state.
+        let params = freenet_git_types::RepoParams {
+            prefix: parsed.prefix.clone(),
+        };
+        let params_bytes = params.to_bytes();
+        let legacy_hashes: Vec<&[u8; 32]> =
+            freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES
+                .iter()
+                .map(|(h, _)| *h)
+                .collect();
+        let result = wsclient::get_state_with_legacy_fallback(
+            &mut api,
+            contract_id,
+            &params_bytes,
+            &legacy_hashes,
+            timeout,
+        )
+        .await?;
+        let state = freenet_git_types::RepoState::from_bytes(&result.state)?;
+
+        // We deliberately do NOT re-PUT the repo state itself here.
+        // Rescue's job is to refresh the *chunks* the network has
+        // forgotten. The repo contract has natural subscription
+        // pressure from any active reader and tends to stay alive,
+        // and re-PUTting it triggers a host-side broadcast cycle
+        // that is much slower than refreshing pack contracts. If
+        // the legacy-fallback path activated, fetch_repo_state in
+        // git-remote-freenet handles the migration re-PUT during
+        // a normal fetch.
+        let _ = (repo_wasm, params_bytes);
+
+        let mut bundle_count = 0usize;
+        let mut chunk_count = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (id, record) in &state.object_index {
+            bundle_count += 1;
+            let bundle_label = format!("bundle {}", hex::encode(id));
+            match &record.bundle {
+                freenet_git_types::ObjectBundle::SinglePack { pack_hash, .. } => {
+                    if let Err(e) = rescue_pack(&mut api, &pack_wasm, *pack_hash, timeout).await {
+                        errors.push(format!("  {bundle_label} (SinglePack): {e}"));
+                    } else {
+                        println!("ok {bundle_label} (SinglePack)");
+                    }
+                }
+                freenet_git_types::ObjectBundle::ChunkedPack {
+                    manifest_hash,
+                    total_size: _,
+                    chunk_count: declared_count,
+                } => match rescue_chunked(&mut api, &pack_wasm, *manifest_hash, timeout).await {
+                    Ok(n) => {
+                        chunk_count += n;
+                        println!("ok {bundle_label} (ChunkedPack, {n}/{declared_count} chunks)",);
+                    }
+                    Err(e) => errors.push(format!("  {bundle_label} (ChunkedPack): {e}")),
+                },
+            }
+        }
+
+        println!();
+        println!(
+            "rescued {} bundle(s), {} chunk(s); {} failure(s)",
+            bundle_count,
+            chunk_count,
+            errors.len()
+        );
+        for line in &errors {
+            eprintln!("{line}");
+        }
+        if errors.is_empty() {
+            Ok::<_, anyhow::Error>(())
+        } else {
+            Err(anyhow::anyhow!(
+                "{} bundle(s) failed to rescue",
+                errors.len()
+            ))
+        }
+    })
+}
+
+async fn rescue_pack(
+    api: &mut freenet_stdlib::client_api::WebApi,
+    pack_wasm: &[u8],
+    pack_hash: [u8; 32],
+    timeout: Duration,
+) -> Result<()> {
+    let bytes = wsclient::get_pack(api, pack_wasm, pack_hash, timeout)
+        .await
+        .with_context(|| format!("GET pack {}", hex::encode(pack_hash)))?;
+    wsclient::put_pack(api, pack_wasm.to_vec(), bytes, timeout)
+        .await
+        .with_context(|| format!("PUT pack {}", hex::encode(pack_hash)))?;
+    Ok(())
+}
+
+async fn rescue_chunked(
+    api: &mut freenet_stdlib::client_api::WebApi,
+    pack_wasm: &[u8],
+    manifest_hash: [u8; 32],
+    timeout: Duration,
+) -> Result<usize> {
+    let manifest_bytes = wsclient::get_pack(api, pack_wasm, manifest_hash, timeout)
+        .await
+        .with_context(|| format!("GET manifest {}", hex::encode(manifest_hash)))?;
+    let manifest = freenet_git_types::chunked::ChunkedPackManifestV1::from_bytes(&manifest_bytes)
+        .context("decode manifest")?;
+    let mut rescued = 0usize;
+    for (i, chunk_hash) in manifest.chunk_hashes.iter().enumerate() {
+        let bytes = wsclient::get_pack(api, pack_wasm, *chunk_hash, timeout)
+            .await
+            .with_context(|| {
+                format!(
+                    "GET chunk {}/{} ({})",
+                    i + 1,
+                    manifest.chunk_count,
+                    hex::encode(chunk_hash)
+                )
+            })?;
+        wsclient::put_pack(api, pack_wasm.to_vec(), bytes, timeout)
+            .await
+            .with_context(|| format!("PUT chunk {}/{}", i + 1, manifest.chunk_count))?;
+        rescued += 1;
+    }
+    // Re-PUT the manifest itself.
+    wsclient::put_pack(api, pack_wasm.to_vec(), manifest_bytes, timeout)
+        .await
+        .context("PUT manifest")?;
+    Ok(rescued)
 }
 
 fn open_bundle_with_prompt(path: &std::path::Path) -> Result<DecryptedBundle> {

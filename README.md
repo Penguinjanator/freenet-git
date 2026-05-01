@@ -17,6 +17,8 @@ Working today:
 - push commits (single pack and multi-chunk)
 - fetch and clone through Git's remote-helper protocol
 - clone live demo repos from the public Freenet network
+- `freenet-git rescue <url>` to re-PUT a repo's bundles when chunks
+  evict from the wider network (cures `exhausted all peers` errors)
 
 Not yet supported:
 
@@ -40,8 +42,6 @@ Not yet supported:
   whitelisted runners, are sketched in
   [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
 - **Releases / package registry, human-readable names** (Phase 4+).
-- **Self-healing `freenet-git rescue` command** for re-PUTting bytes
-  the network has forgotten (filed; not yet shipped).
 - **Parallel chunk uploads.** Pushing repos with hundreds of chunks
   is currently slow (filed; not yet shipped).
 
