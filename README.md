@@ -3,10 +3,17 @@
 Git over [Freenet](https://freenet.org). Push, fetch, and clone Git
 repositories through the Freenet network instead of a centralized host.
 
-> **Live demo:** this README is also hosted on Freenet at
-> `freenet::3ECc6j4vtAjL/freenet-git`. After
-> `cargo install freenet-git` and starting a local Freenet node:
-> `git clone freenet::3ECc6j4vtAjL/freenet-git`.
+> **Live demos** — actually hosted on Freenet, clonable today:
+>
+> - **freenet-core** (HEAD source snapshot, 483 files):
+>   `git clone freenet::AaRxPZVdWrPh/freenet-core`
+> - **freenet-stdlib** (full git history, 177 commits):
+>   `git clone freenet::2pyvKxrozxgT/freenet-stdlib`
+> - **freenet-git README pointer** (the original tiny dogfood):
+>   `git clone freenet::3ECc6j4vtAjL/freenet-git`
+>
+> Requires `cargo install freenet-git` and a running local Freenet
+> node — see "Quick start" below.
 
 > **Status: Phase 1 demo working end-to-end** against the live Freenet
 > network. Tracked in
