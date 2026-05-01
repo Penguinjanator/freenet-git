@@ -287,7 +287,7 @@ async fn fetch_repo_state(
         // legacy state via the fallback path.
         match wsclient::put_contract(
             api,
-            repo_wasm.to_vec(),
+            repo_wasm,
             params_bytes.clone(),
             state.clone(),
             ws_timeout(),
@@ -575,7 +575,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                 );
                 let pack_key = wsclient::put_pack(
                     &mut api,
-                    pack_wasm.clone(),
+                    &pack_wasm,
                     pack_bytes.clone(),
                     ws_timeout(),
                 )
@@ -596,7 +596,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                 );
                 let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(
                     &env.ws_url,
-                    pack_wasm.clone(),
+                    &pack_wasm,
                     pack_bytes.clone(),
                     chunk_size,
                     freenet_git_cli::chunked::parallelism_from_env(),

@@ -123,7 +123,7 @@ pub enum PublishPhase {
 /// via [`publish_chunked_pack_with_progress`].
 pub async fn publish_chunked_pack(
     ws_url: &str,
-    pack_wasm: Vec<u8>,
+    pack_wasm: &[u8],
     pack_bytes: Vec<u8>,
     chunk_size: u32,
     timeout_per_op: Duration,
@@ -148,7 +148,7 @@ pub async fn publish_chunked_pack(
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_chunked_pack_with_progress<F>(
     ws_url: &str,
-    pack_wasm: Vec<u8>,
+    pack_wasm: &[u8],
     pack_bytes: Vec<u8>,
     chunk_size: u32,
     parallelism: usize,
@@ -192,24 +192,24 @@ where
     // without inter-chunk contention as long as `buffer_unordered`'s
     // concurrency cap matches `conns.len()`.
 
-    // Wrap the WASM blob in Arc so phase 2 chunk tasks can hand
-    // `&pack_wasm` to wsclient::get_pack (which takes `&[u8]`) at
-    // refcount cost rather than per-chunk deep-clone. Phase 1 still
-    // deep-clones inside the closure because wsclient::put_pack
-    // consumes `Vec<u8>` so it can re-use the bytes across its
-    // internal retry attempts; eliminating that would require
-    // reworking put_pack's signature.
-    let pack_wasm = Arc::new(pack_wasm);
+    // Wrap the WASM blob in Arc so chunk tasks share one allocation
+    // across both phases (refcount bump per task instead of deep
+    // clone). Both put_pack and get_pack take `&[u8]`, so the Arc
+    // hands out `&pack_wasm` directly. wsclient::put_contract clones
+    // once per retry attempt; that cost is unchanged from the
+    // pre-borrow signature (the previous caller cloned per attempt
+    // too).
+    let pack_wasm = Arc::new(pack_wasm.to_vec());
 
     // Phase 1: PUT every chunk in parallel.
     let mut puts_completed: u32 = 0;
     let mut put_stream = futures::stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| {
             let conn = conns[i % conns.len()].clone();
-            let pack_wasm = (*pack_wasm).clone();
+            let pack_wasm = pack_wasm.clone();
             async move {
                 let mut conn = conn.lock().await;
-                wsclient::put_pack(&mut conn, pack_wasm, chunk, timeout_per_op)
+                wsclient::put_pack(&mut conn, &pack_wasm, chunk, timeout_per_op)
                     .await
                     .with_context(|| format!("PUT chunk {i}"))?;
                 anyhow::Ok(())
@@ -266,7 +266,7 @@ where
         let mut conn = conns[0].lock().await;
         wsclient::put_pack(
             &mut conn,
-            (*pack_wasm).clone(),
+            &pack_wasm,
             manifest_bytes.clone(),
             timeout_per_op,
         )
