@@ -34,10 +34,11 @@ use freenet_git_types::signing::{sign_bundle_record, sign_ref_entry};
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
 
-/// Default per-op WS timeout. The gateway can take ~60s to relay a
-/// PUT confirmation under load (we observed this consistently against
-/// the production gateway during initial dogfooding); 180s gives 3x
-/// headroom. Override with `FREENET_GIT_WS_TIMEOUT_SECS`.
+/// Default per-op WS timeout. A PUT confirmation can take ~60s
+/// under network load (the local node has to forward to the peers
+/// that subscribe to the contract's location and wait for them to
+/// store and acknowledge); 180s gives 3x headroom. Override with
+/// `FREENET_GIT_WS_TIMEOUT_SECS`.
 fn ws_timeout() -> Duration {
     Duration::from_secs(
         std::env::var("FREENET_GIT_WS_TIMEOUT_SECS")
@@ -343,7 +344,7 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         let total_bundles = state.object_index.len();
         let total_size: u64 = state.object_index.values().map(bundle_size).sum();
         eprintln!(
-            "==> {total_bundles} bundle(s), {} total (~60s per chunk against a busy gateway)",
+            "==> {total_bundles} bundle(s), {} total (~60s per chunk under load)",
             human_bytes(total_size),
         );
 
@@ -585,10 +586,9 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                     size_bytes: pack_bytes.len() as u64,
                 }
             } else {
-                let total_chunks =
-                    (pack_bytes.len() as u64).div_ceil(chunk_size as u64);
+                let total_chunks = (pack_bytes.len() as u64).div_ceil(chunk_size as u64);
                 eprintln!(
-                    "==> publishing {} pack as {total_chunks} chunks (~60s per chunk against a busy gateway)",
+                    "==> publishing {} pack as {total_chunks} chunks (~60s per chunk under load)",
                     human_bytes(pack_bytes.len() as u64),
                 );
                 let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(

@@ -101,8 +101,9 @@ enum Cmd {
         #[arg(long, conflicts_with = "publish_to")]
         no_publish: bool,
         /// Override the default 180-second confirmation timeout. First-PUT
-        /// against a busy gateway can take ~60s for the host to relay the
-        /// confirmation; 180s gives 3x headroom.
+        /// under network load can take ~60s for the local node to forward
+        /// to subscribing peers and collect confirmation; 180s gives 3x
+        /// headroom.
         #[arg(long, default_value = "180")]
         publish_timeout_secs: u64,
     },
