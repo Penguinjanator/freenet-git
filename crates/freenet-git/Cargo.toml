@@ -16,6 +16,8 @@ include = [
     "contracts/*.wasm",
     "Cargo.toml",
     "README.md",
+    "build.rs",
+    "legacy_contracts.toml",
 ]
 
 [[bin]]
