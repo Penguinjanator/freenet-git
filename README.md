@@ -41,7 +41,11 @@ Not yet supported:
   N-of-M reproducible-build agreement to TEE attestation to simple
   whitelisted runners, are sketched in
   [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985).
-- **Releases / package registry, human-readable names** (Phase 4+).
+- **Releases / package registry, discovery via search and
+  reputation** (Phase 4+). Discovery is not a first-come-first-served
+  namespace; it's a search engine over published repos plus a
+  reputation signal so people can tell which `freenet-core` is
+  the one they want.
 - **Parallel chunk uploads.** Pushing repos with hundreds of chunks
   is currently slow (filed; not yet shipped).
 
@@ -212,11 +216,13 @@ The same pattern with the missing pieces filled in:
   verify "this commit's tests passed" against whatever trust model
   the project picked (whitelisted runners, N-of-M reproducible
   build agreement, TEE attestation).
-- **Phase 4+, issues, releases, human-readable names.** Issues as
-  per-repo append-only signed timelines. Releases as signed tag
-  refs plus artifact contracts. A Freenet-native ENS-style layer so
-  Ian can hand someone `freenet:freenet-core` instead of the
-  base58-prefixed form.
+- **Phase 4+, issues, releases, discovery.** Issues as per-repo
+  append-only signed timelines. Releases as signed tag refs plus
+  artifact contracts. Discovery is a search engine over published
+  repos plus a reputation signal, not a first-come-first-served
+  name registry. You search for "freenet-core", see candidates
+  ranked by reputation, and pick the one that's actually upstream
+  rather than racing someone to grab a global name.
 
 Until those phases land, the `git remote add` / `git fetch` /
 out-of-band-tell-the-maintainer loop above is the supported flow.
@@ -338,9 +344,10 @@ The goal is a decentralized software forge, built incrementally:
   maintainer-whitelist to N-of-M reproducible-build agreement to
   TEE attestation.
 - **Phase 4+:** issues (per-repo append-only signed timelines),
-  releases (signed tag refs + artifact contracts), human-readable
-  names (a Freenet-native ENS-style layer), per-user identity
-  contracts that link to PGP/SSH/GitHub identities for continuity.
+  releases (signed tag refs + artifact contracts), discovery via
+  search and reputation rather than a first-come-first-served name
+  registry, per-user identity contracts that link to PGP/SSH/GitHub
+  identities for continuity.
 
 See [freenet-core#3985](https://github.com/freenet/freenet-core/issues/3985)
 for the design and rationale.
