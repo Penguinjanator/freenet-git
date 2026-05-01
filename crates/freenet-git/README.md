@@ -140,10 +140,10 @@ add OS-keychain integration.
 
 ## Keeping a published repo alive
 
-Freenet is a communication medium, not a storage medium. Contracts
-that nobody is actively reading get evicted from peers over time
-to make room for hotter content. For a freenet-git repo this shows
-up as:
+Freenet is a communication medium, not a storage medium. Peers
+keep contracts in an LRU cache, so anything that nobody has touched
+recently is the first thing dropped to make room for hotter content.
+For a freenet-git repo this shows up as:
 
 ```
 error: fetch ChunkedPack ...
@@ -159,7 +159,8 @@ freenet-git rescue freenet:<prefix>/<label>
 ```
 
 This re-PUTs every bundle and chunk the repo references, which
-re-broadcasts each to ~50 fresh peers and resets the eviction clock.
+re-broadcasts each to whichever peers subscribe to that contract's
+location and bumps it back to the top of their LRU cache.
 
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that

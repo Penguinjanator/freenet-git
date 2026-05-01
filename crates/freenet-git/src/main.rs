@@ -112,8 +112,9 @@ enum Cmd {
     ///
     /// MVP behaviour: connects to the local Freenet node, GETs each
     /// bundle (and chunks) via the local node's cache or the network,
-    /// then PUTs each one back. This re-broadcasts to fresh peers and
-    /// resets the eviction clock.
+    /// then PUTs each one back. This re-broadcasts to whichever peers
+    /// subscribe to each contract's location and bumps the bytes back
+    /// to the top of their LRU cache.
     ///
     /// Future versions will reconstruct missing bytes from a local
     /// clone (`--from <path>`) when the local node's cache no longer
@@ -376,7 +377,9 @@ fn repo_id_string(pubkey: &[u8]) -> String {
 /// network, refreshing the hot copy. The local Freenet node serves
 /// as the byte source: each bundle is GET'd (which pulls from local
 /// cache if hosted, or from the wider network if not), then PUT
-/// back, which triggers a fresh broadcast to ~50 peers.
+/// back, which broadcasts to whichever peers subscribe to that
+/// contract's location and bumps the bytes back to the top of their
+/// LRU cache.
 fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> {
     let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
     let ws = ws_url.unwrap_or(DEFAULT_WS_URL).to_string();
