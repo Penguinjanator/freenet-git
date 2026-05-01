@@ -91,7 +91,7 @@ enum Cmd {
         repo_wasm: Option<PathBuf>,
         /// WebSocket URL of a local Freenet node. Defaults to the
         /// stdlib's standard endpoint
-        /// (`ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native`).
+        /// (`ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`).
         /// Pass `--no-publish` to skip the network call and just print
         /// the would-be URL.
         #[arg(long)]

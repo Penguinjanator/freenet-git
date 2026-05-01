@@ -99,7 +99,7 @@ This installs both `freenet-git` (the companion CLI) and
 You need a Freenet node running locally to talk to. See the
 [Freenet getting-started guide](https://docs.freenet.org/). The
 WebSocket API endpoint defaults to
-`ws://127.0.0.1:50509/v1/contract/command`.
+`ws://127.0.0.1:7509/v1/contract/command`.
 
 ### 3. Clone a live repo
 

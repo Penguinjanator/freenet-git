@@ -23,11 +23,11 @@ use tokio_tungstenite::connect_async;
 /// Default WebSocket endpoint for a local Freenet node. The path is the
 /// stdlib's contract command socket; `?encodingProtocol=native` matches
 /// what `riverctl` and `fdev` use.
-pub const DEFAULT_WS_URL: &str = "ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native";
+pub const DEFAULT_WS_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
 /// Open a `WebApi` connection to a local Freenet node.
 ///
-/// `url` should look like `ws://127.0.0.1:50509/v1/contract/command?encodingProtocol=native`.
+/// `url` should look like `ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`.
 /// If you want the default, pass [`DEFAULT_WS_URL`].
 pub async fn connect(url: &str) -> Result<WebApi> {
     let (ws_stream, _) = connect_async(url)
