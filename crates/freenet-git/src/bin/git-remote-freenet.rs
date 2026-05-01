@@ -334,39 +334,62 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     runtime.block_on(async {
         let mut api = wsclient::connect(&env.ws_url).await?;
 
+        eprintln!("==> reading repo state from Freenet");
         let state = fetch_repo_state(env, &mut api, &repo_wasm).await?;
 
         let pack_dir = env.git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        // Fetch every bundle in object_index and feed the resulting
-        // pack bytes to `git index-pack`. SinglePack and ChunkedPack
-        // both terminate as "a pack ready for index-pack"; the only
-        // difference is how we get there.
-        for record in state.object_index.values() {
+        let total_bundles = state.object_index.len();
+        let total_size: u64 = state.object_index.values().map(bundle_size).sum();
+        eprintln!(
+            "==> {total_bundles} bundle(s), {} total (~60s per chunk against a busy gateway)",
+            human_bytes(total_size),
+        );
+
+        for (i, record) in state.object_index.values().enumerate() {
+            let n = i + 1;
             let pack_bytes = match &record.bundle {
-                ObjectBundle::SinglePack { pack_hash, .. } => {
+                ObjectBundle::SinglePack {
+                    pack_hash,
+                    size_bytes,
+                } => {
+                    eprintln!(
+                        "    [{n}/{total_bundles}] downloading pack ({})",
+                        human_bytes(*size_bytes),
+                    );
                     wsclient::get_pack(&mut api, &pack_wasm, *pack_hash, ws_timeout()).await?
                 }
                 ObjectBundle::ChunkedPack {
                     manifest_hash,
                     total_size,
                     chunk_count,
-                } => freenet_git_cli::chunked::fetch_chunked_pack(
-                    &mut api,
-                    &pack_wasm,
-                    *manifest_hash,
-                    *total_size,
-                    *chunk_count,
-                    ws_timeout(),
-                )
-                .await
-                .with_context(|| format!("fetch ChunkedPack {}", hex::encode(manifest_hash)))?,
+                } => {
+                    eprintln!(
+                        "    [{n}/{total_bundles}] downloading {chunk_count} chunks ({})",
+                        human_bytes(*total_size),
+                    );
+                    let bytes = freenet_git_cli::chunked::fetch_chunked_pack_with_progress(
+                        &mut api,
+                        &pack_wasm,
+                        *manifest_hash,
+                        *total_size,
+                        *chunk_count,
+                        ws_timeout(),
+                        |chunk_i, chunk_n, _hash| {
+                            eprintln!("        chunk {chunk_i}/{chunk_n}");
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("fetch ChunkedPack {}", hex::encode(manifest_hash)))?;
+                    bytes
+                }
             };
             install_pack(&env.git_dir, &pack_bytes)?;
         }
 
         let _ = wants;
+        eprintln!("==> done");
         Ok::<_, anyhow::Error>(())
     })?;
 
@@ -374,6 +397,28 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+fn bundle_size(record: &freenet_git_types::ObjectBundleRecord) -> u64 {
+    match &record.bundle {
+        ObjectBundle::SinglePack { size_bytes, .. } => *size_bytes,
+        ObjectBundle::ChunkedPack { total_size, .. } => *total_size,
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    if n >= GIB {
+        format!("{:.1} GiB", n as f64 / GIB as f64)
+    } else if n >= MIB {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    } else if n >= KIB {
+        format!("{:.1} KiB", n as f64 / KIB as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 /// Returns true if the local git repo is a shallow clone. A shallow
@@ -486,6 +531,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         // Use the legacy-aware fetch so push-from-old-version flows
         // discover the migrated state and don't try to push a fresh
         // ref-update onto an empty current contract.
+        eprintln!("==> reading repo state from Freenet");
         let state = fetch_repo_state(env, &mut api, &repo_wasm).await?;
 
         let params = freenet_git_types::RepoParams {
@@ -520,6 +566,10 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             //   pack_size <= CHUNK_SIZE  -> SinglePack
             //   pack_size > CHUNK_SIZE   -> ChunkedPack
             let bundle_obj = if (pack_bytes.len() as u64) <= chunk_size as u64 {
+                eprintln!(
+                    "==> publishing {} pack as a single bundle",
+                    human_bytes(pack_bytes.len() as u64),
+                );
                 let pack_key = wsclient::put_pack(
                     &mut api,
                     pack_wasm.clone(),
@@ -535,21 +585,34 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                     size_bytes: pack_bytes.len() as u64,
                 }
             } else {
+                let total_chunks =
+                    (pack_bytes.len() as u64).div_ceil(chunk_size as u64);
                 eprintln!(
-                    "info: pack is {} bytes, splitting into chunks of {chunk_size} bytes",
-                    pack_bytes.len()
+                    "==> publishing {} pack as {total_chunks} chunks (~60s per chunk against a busy gateway)",
+                    human_bytes(pack_bytes.len() as u64),
                 );
-                let published = freenet_git_cli::chunked::publish_chunked_pack(
+                let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(
                     &mut api,
                     pack_wasm.clone(),
                     pack_bytes.clone(),
                     chunk_size,
                     ws_timeout(),
+                    |phase, i, n| {
+                        use freenet_git_cli::chunked::PublishPhase;
+                        let label = match phase {
+                            PublishPhase::PutChunk => "PUT chunk",
+                            PublishPhase::VerifyChunk => "verify chunk",
+                            PublishPhase::PutManifest => "PUT manifest",
+                            PublishPhase::VerifyManifest => "verify manifest",
+                        };
+                        eprintln!("        {label} {i}/{n}");
+                    },
                 )
                 .await?;
                 eprintln!(
-                    "info: published ChunkedPack ({} chunks, {} bytes total)",
-                    published.chunk_count, published.total_size,
+                    "==> published {} chunks, {} total",
+                    published.chunk_count,
+                    human_bytes(published.total_size),
                 );
                 published.bundle
             };
@@ -577,6 +640,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         let _ = merged;
 
         // UPDATE the repo contract with the signed delta.
+        eprintln!("==> updating repo state on Freenet");
         wsclient::update_state(
             &mut api,
             env.contract_id,
@@ -584,6 +648,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             ws_timeout(),
         )
         .await?;
+        eprintln!("==> done");
 
         Ok::<_, anyhow::Error>((ok_lines, error_lines))
     })?;

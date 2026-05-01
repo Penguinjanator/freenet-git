@@ -58,6 +58,47 @@ pub async fn publish_chunked_pack(
     chunk_size: u32,
     timeout_per_op: Duration,
 ) -> Result<PublishedChunkedPack> {
+    publish_chunked_pack_with_progress(
+        web_api,
+        pack_wasm,
+        pack_bytes,
+        chunk_size,
+        timeout_per_op,
+        |_, _, _| {},
+    )
+    .await
+}
+
+/// Phase that the publish state machine is in. The CLI uses this
+/// to emit user-visible progress lines.
+#[derive(Debug, Clone, Copy)]
+pub enum PublishPhase {
+    /// PUTting chunk `i` of `n` to the network.
+    PutChunk,
+    /// Re-GETting chunk `i` of `n` for content-addressing verification.
+    VerifyChunk,
+    /// PUTting the manifest. `i` is 1, `n` is 1.
+    PutManifest,
+    /// Re-GETting the manifest for verification. `i` is 1, `n` is 1.
+    VerifyManifest,
+}
+
+/// Publish a packfile as a [`ObjectBundle::ChunkedPack`] with
+/// per-step progress callbacks. Same semantics as
+/// [`publish_chunked_pack`]; the callback fires for each PUT and
+/// re-GET so a CLI can emit user-facing progress lines for the slow
+/// network operations.
+pub async fn publish_chunked_pack_with_progress<F>(
+    web_api: &mut WebApi,
+    pack_wasm: Vec<u8>,
+    pack_bytes: Vec<u8>,
+    chunk_size: u32,
+    timeout_per_op: Duration,
+    mut on_step: F,
+) -> Result<PublishedChunkedPack>
+where
+    F: FnMut(PublishPhase, u32, u32),
+{
     if pack_bytes.is_empty() {
         bail!("publish_chunked_pack: empty pack");
     }
@@ -71,8 +112,11 @@ pub async fn publish_chunked_pack(
         .validate()
         .context("manifest self-check before publish")?;
 
+    let n = manifest.chunk_count;
+
     // Phase 1: PUT every chunk contract.
     for (i, chunk) in chunks.iter().enumerate() {
+        on_step(PublishPhase::PutChunk, (i as u32) + 1, n);
         wsclient::put_pack(web_api, pack_wasm.clone(), chunk.clone(), timeout_per_op)
             .await
             .with_context(|| format!("PUT chunk {i}"))?;
@@ -80,6 +124,7 @@ pub async fn publish_chunked_pack(
 
     // Phase 2: re-GET each chunk and verify.
     for (i, expected_hash) in manifest.chunk_hashes.iter().enumerate() {
+        on_step(PublishPhase::VerifyChunk, (i as u32) + 1, n);
         let got = wsclient::get_pack(web_api, &pack_wasm, *expected_hash, timeout_per_op)
             .await
             .with_context(|| format!("re-GET chunk {i} for verification"))?;
@@ -94,6 +139,7 @@ pub async fn publish_chunked_pack(
     }
 
     // Phase 3: PUT the manifest as a pack-contract.
+    on_step(PublishPhase::PutManifest, 1, 1);
     let manifest_bytes = manifest.to_bytes();
     let manifest_hash = *blake3::hash(&manifest_bytes).as_bytes();
     wsclient::put_pack(
@@ -106,6 +152,7 @@ pub async fn publish_chunked_pack(
     .context("PUT manifest")?;
 
     // Phase 4: re-GET the manifest and verify.
+    on_step(PublishPhase::VerifyManifest, 1, 1);
     let got_manifest = wsclient::get_pack(web_api, &pack_wasm, manifest_hash, timeout_per_op)
         .await
         .context("re-GET manifest for verification")?;
@@ -124,7 +171,33 @@ pub async fn publish_chunked_pack(
     })
 }
 
-/// Fetch and reassemble a [`ObjectBundle::ChunkedPack`].
+/// Fetch and reassemble a [`ObjectBundle::ChunkedPack`] without
+/// progress feedback. See [`fetch_chunked_pack_with_progress`] for
+/// the variant that calls back per chunk for CLI feedback.
+pub async fn fetch_chunked_pack(
+    web_api: &mut WebApi,
+    pack_wasm: &[u8],
+    manifest_hash: [u8; 32],
+    expected_total_size: u64,
+    expected_chunk_count: u32,
+    timeout_per_op: Duration,
+) -> Result<Vec<u8>> {
+    fetch_chunked_pack_with_progress(
+        web_api,
+        pack_wasm,
+        manifest_hash,
+        expected_total_size,
+        expected_chunk_count,
+        timeout_per_op,
+        |_, _, _| {},
+    )
+    .await
+}
+
+/// Fetch and reassemble a [`ObjectBundle::ChunkedPack`] with
+/// per-chunk progress callbacks. The callback receives
+/// `(chunk_index, chunk_count, chunk_hash)` BEFORE each chunk GET
+/// fires, so a CLI can emit a "fetching chunk 3 of 7" line.
 ///
 /// 1. GET the manifest by `manifest_hash`. Verify `BLAKE3 == manifest_hash`.
 /// 2. Decode the manifest. Re-validate internal consistency rules.
@@ -135,14 +208,18 @@ pub async fn publish_chunked_pack(
 ///    manifest's expectation (`chunk_size` for non-final, computed
 ///    remainder for final).
 /// 5. Concatenate in order and return.
-pub async fn fetch_chunked_pack(
+pub async fn fetch_chunked_pack_with_progress<F>(
     web_api: &mut WebApi,
     pack_wasm: &[u8],
     manifest_hash: [u8; 32],
     expected_total_size: u64,
     expected_chunk_count: u32,
     timeout_per_op: Duration,
-) -> Result<Vec<u8>> {
+    mut on_chunk: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(u32, u32, &[u8; 32]),
+{
     // 1. GET the manifest. wsclient::get_pack already verifies BLAKE3.
     let manifest_bytes = wsclient::get_pack(web_api, pack_wasm, manifest_hash, timeout_per_op)
         .await
@@ -171,6 +248,7 @@ pub async fn fetch_chunked_pack(
     //    later optimization once we hammer this on a real network.)
     let mut assembled: Vec<u8> = Vec::with_capacity(manifest.total_size as usize);
     for (i, expected_hash) in manifest.chunk_hashes.iter().enumerate() {
+        on_chunk((i as u32) + 1, manifest.chunk_count, expected_hash);
         let chunk = wsclient::get_pack(web_api, pack_wasm, *expected_hash, timeout_per_op)
             .await
             .with_context(|| format!("GET chunk {i}"))?;
