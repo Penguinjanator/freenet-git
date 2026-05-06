@@ -1,22 +1,40 @@
-//! Passphrase-encrypted ed25519 identity bundle for freenet-git.
+//! ed25519 identity bundle for freenet-git, optionally encrypted at rest.
 //!
 //! The bundle stores the user's signing key and a registry of repos they
-//! have created. Encrypted at rest with `scrypt`-derived keys plus
-//! ChaCha20-Poly1305. Lives by default at
-//! `~/.config/freenet/git-identity.bundle`.
+//! have created. By default it is encrypted at rest with `scrypt`-derived
+//! keys plus XChaCha20-Poly1305; the empty-passphrase mode described
+//! under "Unencrypted bundles" below skips the encryption layer. Lives by
+//! default at `~/.config/freenet/git-identity.bundle`.
 //!
-//! # Threat model
+//! # Encryption is opt-in
 //!
-//! Identical to SSH key material:
+//! For passphrase-protected bundles, the threat model is identical to
+//! SSH key material: a local attacker with disk access AND the
+//! passphrase can sign as you; with disk access only they see
+//! ciphertext and have to brute-force scrypt; a remote attacker never
+//! sees the secret.
 //!
-//! - A local attacker with **disk access AND the passphrase** can sign as
-//!   you. Phase 1 does not protect against that case.
-//! - A local attacker with **disk access only** sees ciphertext. Brute
-//!   forcing the passphrase requires running scrypt at the pinned
-//!   parameters per guess; with a strong passphrase that is infeasible.
-//! - A **remote attacker** never sees the secret — it is only on the user's
-//!   disk. The on-host helper holds the decrypted secret in memory only
-//!   for the duration of one CLI invocation.
+//! For unencrypted bundles, the on-disk file alone holds the signing
+//! authority. That's fine when the file itself is already protected
+//! (CI secrets, an OS keychain, an encrypted volume) — adding a
+//! passphrase on top under those conditions is redundant. See below.
+//!
+//! # Unencrypted bundles
+//!
+//! Calling [`seal`] (or [`write_bundle`]) with an empty passphrase
+//! produces a bundle whose contents are recoverable by anyone holding
+//! the file: the KDF step is skipped and a fixed all-zero key is used
+//! in its place. Symmetrically, [`open`] (and [`read_bundle`]) with an
+//! empty passphrase succeeds for unencrypted bundles and fails the AEAD
+//! tag check for encrypted ones.
+//!
+//! The on-disk envelope still carries fresh `KdfParams` (salt, work
+//! factors) for unencrypted bundles, even though they are unused in the
+//! key-derivation step. This keeps the wire format unchanged so older
+//! readers continue to deserialize the envelope (they will fail
+//! decryption, since they have no empty-passphrase shortcut, but the
+//! parse succeeds). Future "optimizations" that elide those fields
+//! would be a wire-format break.
 //!
 //! # Wire format (v1)
 //!
@@ -156,6 +174,23 @@ impl KdfParams {
     }
 
     fn derive_key(&self, passphrase: &str) -> Result<[u8; 32], BundleError> {
+        // Empty passphrase is a sentinel for "unencrypted at rest": the
+        // key is publicly derivable (all zeros) so anyone with the file
+        // can open it. Used when the bundle file itself lives in an
+        // authenticated secret store (GitHub Actions secrets, OS
+        // keychain) and the on-disk encryption layer is redundant.
+        // Skips scrypt to keep CLI invocations snappy in CI.
+        //
+        // NOTE: this short-circuits before `enforce_minimum`, so weak
+        // KdfParams in the envelope are ignored on the empty-passphrase
+        // path. The KDF parameters are unused there anyway. If a future
+        // change tightens the scrypt floor, the empty-passphrase
+        // shortcut must remain exempt — otherwise existing unencrypted
+        // bundles produced under the old floor would suddenly fail to
+        // open after an upgrade.
+        if passphrase.is_empty() {
+            return Ok([0u8; 32]);
+        }
         self.enforce_minimum()?;
         let params = scrypt::Params::new(self.log_n, self.r, self.p, 32)
             .map_err(|e| BundleError::Crypto(format!("scrypt params: {e}")))?;
@@ -542,5 +577,54 @@ mod tests {
         // Decoded bytes must equal the public key.
         let decoded = bs58::decode(&s["freenet:id:".len()..]).into_vec().unwrap();
         assert_eq!(decoded, bundle.public_key);
+    }
+
+    #[test]
+    fn empty_passphrase_round_trip() {
+        let bundle = DecryptedBundle::new("None".into(), "n@e.com".into());
+        let sealed = seal(&bundle, "").unwrap();
+        let opened = open(&sealed, "").unwrap();
+        assert_eq!(opened.public_key, bundle.public_key);
+        assert_eq!(opened.name, "None");
+    }
+
+    #[test]
+    fn empty_passphrase_does_not_open_encrypted_bundle() {
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "real-passphrase").unwrap();
+        match open(&sealed, "") {
+            Err(BundleError::Decrypt) => {}
+            other => panic!("expected Decrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_passphrase_does_not_open_unencrypted_bundle() {
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "").unwrap();
+        match open(&sealed, "real-passphrase") {
+            Err(BundleError::Decrypt) => {}
+            other => panic!("expected Decrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unencrypted_bundle_round_trip_through_disk_with_0600_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id.bundle");
+        let bundle = DecryptedBundle::new("Plain".into(), "p@e.com".into());
+        write_bundle(&bundle, "", &path).unwrap();
+        let opened = read_bundle(&path, "").unwrap();
+        assert_eq!(opened.name, "Plain");
+
+        // The whole point of the "Bundle is unencrypted at rest -- protect
+        // the file accordingly" warning in the CLI is that 0600 is now the
+        // only on-disk defense. Pin the contract.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "unencrypted bundle on disk must be 0600");
+        }
     }
 }
