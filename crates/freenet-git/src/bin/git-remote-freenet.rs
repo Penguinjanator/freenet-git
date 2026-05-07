@@ -17,6 +17,11 @@
 //!   call. No incremental delta-pack optimization yet.
 //! - Fetch downloads every pack referenced in `object_index`. No
 //!   per-object reachability shortcut yet.
+//! - Push semantics: a non-force push requires the remote tip to be
+//!   in the local repo (so the helper can compute objects to send).
+//!   A force push (`git push --force` or `+refspec`) replaces the
+//!   remote tip even when the local has never seen it -- the natural
+//!   case for snapshot mirroring of orphan commits.
 
 #![deny(unsafe_code)]
 
@@ -579,7 +584,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
 
         for spec in pushes {
             // git sends `<src>:<dst>`; src may have a leading '+' for force.
-            let (src, dst) = parse_push_spec(spec)?;
+            let (force, src, dst) = parse_push_spec(spec)?;
             if src.is_empty() {
                 error_lines.push(format!("error {dst} delete-ref not supported in Phase 1.0"));
                 continue;
@@ -589,7 +594,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             // Determine "have" = current target if any, so pack-objects
             // can produce a thin pack from <have>..<new_target>.
             let prev = state.refs.get(&dst).map(|e| hex::encode(e.target));
-            let pack_bytes = match build_pack(&env.git_dir, prev.as_deref(), &new_target) {
+            let pack_bytes = match build_pack(&env.git_dir, prev.as_deref(), &new_target, force) {
                 Ok(b) => b,
                 Err(e) => {
                     error_lines.push(format!("error {dst} {e}"));
@@ -702,8 +707,8 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
     Ok(())
 }
 
-fn parse_push_spec(spec: &str) -> Result<(String, String)> {
-    let (force_stripped, _force) = match spec.strip_prefix('+') {
+fn parse_push_spec(spec: &str) -> Result<(bool, String, String)> {
+    let (force_stripped, force) = match spec.strip_prefix('+') {
         Some(rest) => (rest, true),
         None => (spec, false),
     };
@@ -713,7 +718,50 @@ fn parse_push_spec(spec: &str) -> Result<(String, String)> {
         .next()
         .ok_or_else(|| anyhow!("push spec missing destination"))?
         .to_string();
-    Ok((src, dst))
+    Ok((force, src, dst))
+}
+
+/// Returns `Ok(true)` if `git_dir` has a commit at `sha`, `Ok(false)`
+/// if the SHA is missing or refers to a non-commit object (blob/tree/
+/// tag), and `Err(...)` for any other failure (corrupt object DB,
+/// invalid `.git`, missing `git` binary, etc.).
+///
+/// Used to gate the `^<have>` arg to `git rev-list`. The contract
+/// state stores ref targets as `CommitHash`, so a `<have>` that
+/// resolves to a non-commit means the local repo is in a
+/// pathological state -- we should treat that the same as "missing"
+/// rather than passing `^<have>` to rev-list and hitting the cryptic
+/// `fatal: not a commit object`.
+///
+/// Implemented via `git rev-parse --verify --quiet <sha>^{commit}`:
+/// - status 0 + stdout = full SHA: exists and is a commit.
+/// - status 1: missing OR not a commit (with `--quiet`, no stderr).
+/// - status 128: command-line / config error -- bubbled up.
+fn commit_exists(git_dir: &std::path::Path, sha: &str) -> Result<bool> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{sha}^{{commit}}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawn git rev-parse")?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    match out.status.code() {
+        Some(1) => Ok(false),
+        other => bail!(
+            "git rev-parse {sha}^{{commit}} failed (status={:?}): {}",
+            other,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 fn git_resolve_ref(git_dir: &std::path::Path, refname: &str) -> Result<String> {
@@ -732,13 +780,45 @@ fn git_resolve_ref(git_dir: &std::path::Path, refname: &str) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().to_string())
 }
 
-fn build_pack(git_dir: &std::path::Path, have: Option<&str>, want: &str) -> Result<Vec<u8>> {
+fn build_pack(
+    git_dir: &std::path::Path,
+    have: Option<&str>,
+    want: &str,
+    force: bool,
+) -> Result<Vec<u8>> {
+    // If `have` is set but the local repo doesn't actually have that
+    // object, `git rev-list ^<have> <want>` will fail with "fatal: bad
+    // object". The canonical case is force-pushing an orphan commit
+    // (snapshot mode in the mirror workflow): the receiver knows about
+    // the previous orphan tip but the local repo has never seen it.
+    // For force pushes, drop `^<have>` and send everything reachable
+    // from `want` -- that's the right semantic for "replace whatever
+    // was there." For non-force pushes, surface a directed error
+    // rather than the cryptic rev-list output.
+    let effective_have = match have {
+        Some(h) if !commit_exists(git_dir, h)? => {
+            if force {
+                None
+            } else {
+                bail!(
+                    "remote tip {h} is not present (or not a commit) in the \
+                     local repo. For snapshot/orphan-style pushes use \
+                     `git push --force` (or prefix the refspec with `+`) to \
+                     overwrite the remote tip's history. For regular \
+                     fast-forward pushes, run `git fetch` to populate the \
+                     missing tip first."
+                );
+            }
+        }
+        other => other,
+    };
+
     // We pipe the rev-list into pack-objects --stdin --revs --thin so
     // git decides which objects need to be in the pack.
     let mut rev_list = Command::new("git");
     rev_list.arg("--git-dir").arg(git_dir);
     rev_list.args(["rev-list", "--objects", want]);
-    if let Some(h) = have {
+    if let Some(h) = effective_have {
         rev_list.arg(format!("^{h}"));
     }
     let rev_list_out = rev_list
@@ -803,4 +883,236 @@ fn init_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_push_spec_force_flag() {
+        let (force, src, dst) = parse_push_spec("+main:main").unwrap();
+        assert!(force, "leading + means force");
+        assert_eq!(src, "main");
+        assert_eq!(dst, "main");
+
+        let (force, src, dst) = parse_push_spec("main:main").unwrap();
+        assert!(!force, "no + means non-force");
+        assert_eq!(src, "main");
+        assert_eq!(dst, "main");
+
+        let (force, src, dst) = parse_push_spec("+refs/heads/main:refs/heads/main").unwrap();
+        assert!(force);
+        assert_eq!(src, "refs/heads/main");
+        assert_eq!(dst, "refs/heads/main");
+    }
+
+    /// Initialize a fresh git repo in `dir` with a single commit and
+    /// return its SHA. Used by build_pack tests to have a real
+    /// reachable object on the `want` side without needing the network.
+    ///
+    /// `commit.gpgsign=false` and `tag.gpgsign=false` are forced
+    /// per-invocation so a developer with global GPG signing on
+    /// doesn't trip a passphrase prompt in the test.
+    ///
+    /// Tests assume `git` is on PATH. GitHub Actions Linux/macOS/Windows
+    /// runners all have it preinstalled.
+    fn init_repo_with_commit(dir: &std::path::Path) -> Result<String> {
+        commit_in(dir, "init", "a.txt", "hello\n", &[])
+    }
+
+    /// Add a commit on top of the current HEAD with the given file
+    /// contents, returning the new SHA. `parents` is left empty for
+    /// `init_repo_with_commit`'s first commit.
+    fn commit_in(
+        dir: &std::path::Path,
+        message: &str,
+        file: &str,
+        contents: &str,
+        _parents: &[&str],
+    ) -> Result<String> {
+        let run = |args: &[&str]| -> Result<()> {
+            let status = Command::new("git").current_dir(dir).args(args).status()?;
+            if !status.success() {
+                bail!("git {} failed: {status}", args.join(" "));
+            }
+            Ok(())
+        };
+        if !dir.join(".git").exists() {
+            run(&["init", "-b", "main", "-q"])?;
+            run(&["config", "user.email", "t@e.com"])?;
+            run(&["config", "user.name", "Tester"])?;
+            run(&["config", "commit.gpgsign", "false"])?;
+            run(&["config", "tag.gpgsign", "false"])?;
+        }
+        std::fs::write(dir.join(file), contents)?;
+        run(&["add", file])?;
+        run(&["commit", "-q", "-m", message])?;
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()?;
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    }
+
+    #[test]
+    fn build_pack_no_have_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+        let pack = build_pack(&git_dir, None, &sha, false).unwrap();
+        assert!(
+            !pack.is_empty(),
+            "empty have should produce a non-empty pack"
+        );
+    }
+
+    #[test]
+    fn build_pack_have_equal_to_want_emits_empty_pack() {
+        // `have == want` means git rev-list emits zero objects. The
+        // pack pack-objects produces is structural-only (a pack
+        // header + empty body). It should be much smaller than a
+        // pack containing real objects.
+        let dir = tempfile::tempdir().unwrap();
+        let sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+        let pack = build_pack(&git_dir, Some(&sha), &sha, false).unwrap();
+        let no_have = build_pack(&git_dir, None, &sha, false).unwrap();
+        assert!(
+            pack.len() < no_have.len(),
+            "have==want pack ({} B) should be smaller than full pack ({} B)",
+            pack.len(),
+            no_have.len()
+        );
+    }
+
+    #[test]
+    fn build_pack_fast_forward_have_is_real_ancestor() {
+        // The production happy path: `have` is the parent commit,
+        // `want` is the child. Pack should contain only the child's
+        // new objects, not the parent's.
+        let dir = tempfile::tempdir().unwrap();
+        let parent = init_repo_with_commit(dir.path()).unwrap();
+        let child = commit_in(dir.path(), "second", "b.txt", "world\n", &[&parent]).unwrap();
+        let git_dir = dir.path().join(".git");
+
+        let incremental = build_pack(&git_dir, Some(&parent), &child, false).unwrap();
+        let full = build_pack(&git_dir, None, &child, false).unwrap();
+
+        assert!(
+            !incremental.is_empty(),
+            "fast-forward pack should contain the new commit + tree + blob"
+        );
+        assert!(
+            incremental.len() < full.len(),
+            "fast-forward pack ({} B) should be smaller than full pack ({} B) \
+             since the parent commit's objects are excluded",
+            incremental.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn build_pack_missing_have_non_force_fails_with_directed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+        // 40-char hex that is definitely not in the new repo.
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let err = build_pack(&git_dir, Some(bogus), &sha, false).unwrap_err();
+        let msg = format!("{err:#}");
+        // Pin the user-visible payload of the directed error message.
+        // Future cleanups must keep the actionable bits (the SHA, the
+        // git fetch hint, the --force hint) so users can recover
+        // without having to read the source.
+        assert!(
+            msg.contains("not present") && msg.contains("local repo"),
+            "expected 'not present' and 'local repo'; got: {msg}"
+        );
+        assert!(
+            msg.contains("git fetch"),
+            "expected 'git fetch' hint; got: {msg}"
+        );
+        assert!(
+            msg.contains("--force"),
+            "expected '--force' hint; got: {msg}"
+        );
+        assert!(
+            msg.contains(bogus),
+            "expected the SHA in the error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_pack_missing_have_force_drops_have_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        // Force=true should make build_pack treat the missing have as
+        // a request to send everything reachable from `want`.
+        let pack = build_pack(&git_dir, Some(bogus), &sha, true).unwrap();
+        assert!(
+            !pack.is_empty(),
+            "force-push of a fresh repo should produce a non-empty pack"
+        );
+    }
+
+    #[test]
+    fn commit_exists_distinguishes_commit_from_bogus() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+        assert!(commit_exists(&git_dir, &sha).unwrap());
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        assert!(!commit_exists(&git_dir, bogus).unwrap());
+    }
+
+    #[test]
+    fn commit_exists_rejects_blob_and_tree() {
+        // Edge case from the skeptical reviewer: if a SHA exists in
+        // the object store but is a blob or tree rather than a commit
+        // (corrupt repo or partial fetch), passing it as `^<have>` to
+        // rev-list would fail with `fatal: not a commit object` --
+        // back to the cryptic error this PR aims to eliminate.
+        // commit_exists must treat non-commits as "not present" so
+        // the directed-error path fires.
+        let dir = tempfile::tempdir().unwrap();
+        let _commit_sha = init_repo_with_commit(dir.path()).unwrap();
+        let git_dir = dir.path().join(".git");
+
+        // Get the SHA of the file blob (tracked file written by
+        // init_repo_with_commit).
+        let blob_out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-parse", "HEAD:a.txt"])
+            .output()
+            .unwrap();
+        let blob_sha = String::from_utf8(blob_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(!blob_sha.is_empty(), "expected a blob sha");
+        assert!(
+            !commit_exists(&git_dir, &blob_sha).unwrap(),
+            "a blob SHA must NOT count as a commit"
+        );
+
+        // Same for the root tree.
+        let tree_out = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        let tree_sha = String::from_utf8(tree_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            !commit_exists(&git_dir, &tree_sha).unwrap(),
+            "a tree SHA must NOT count as a commit"
+        );
+    }
 }
