@@ -439,7 +439,14 @@ pub async fn put_pack(
         )
         .await
         {
-            Ok(key) => return Ok(key),
+            Ok(key) => {
+                // Cache the bytes we just successfully PUT so a
+                // later rescue can re-PUT from the cache without
+                // having to network-GET them back. See pack_cache
+                // module docs and freenet/freenet-git#22.
+                crate::pack_cache::write_async(&pack_hash, &pack_bytes).await;
+                return Ok(key);
+            }
             Err(e) => {
                 let msg = format!("{e}");
                 tracing::warn!(
@@ -461,6 +468,13 @@ pub async fn put_pack(
 /// (`BLAKE3(returned_bytes) == pack_hash`) before returning so a
 /// pathological host cannot hand us bytes claiming to be a specific
 /// pack.
+///
+/// Consults the on-disk pack cache before going to the network. Cache
+/// hits skip the network entirely; cache misses (or a missing /
+/// disabled cache) fall through to the WS GET, and the returned
+/// bytes are written back to the cache. The cache is a hard offline
+/// shortcut for re-clones / retries against a slow gateway -- see
+/// freenet/freenet-git#22.
 pub async fn get_pack(
     web_api: &mut WebApi,
     pack_wasm: &[u8],
@@ -470,7 +484,60 @@ pub async fn get_pack(
     let parameters = Parameters::from(pack_hash.to_vec());
     let code = ContractCode::from(pack_wasm.to_vec());
     let key = ContractKey::from_params_and_code(parameters, &code);
-    let bytes = get_state(web_api, *key.id(), false, timeout).await?;
+    let id = *key.id();
+    let cache = crate::pack_cache::PackCache::from_environment();
+    get_pack_with_fetcher(cache.as_ref(), pack_hash, move |_hash| async move {
+        get_state(web_api, id, false, timeout).await
+    })
+    .await
+}
+
+/// Inner cache-aware GET. Factored out from `get_pack` so the
+/// cache-hit / cache-miss / verify / cache-write branches are
+/// unit-testable without a live `WebApi` or environment-variable
+/// manipulation. Production passes a cache resolved from
+/// environment; tests pass an explicit `PackCache::at(tempdir)` so
+/// they don't race other tests on shared env vars.
+///
+/// `cache: None` disables the cache for this call entirely (the
+/// fetcher is always invoked, no read or write happens). That's
+/// also the path taken when the user sets
+/// `FREENET_GIT_PACK_CACHE=off` in production, since
+/// `PackCache::from_environment` returns `None` in that case.
+///
+/// **Defense in depth:** even though `PackCache::read_async`
+/// already verifies BLAKE3 on every cache hit, this function
+/// re-verifies after the read. Belt-and-braces because a future
+/// refactor of `PackCache::read` that drops verification (e.g.
+/// "for performance") would silently turn the GET path into a
+/// poison vector.
+async fn get_pack_with_fetcher<F, Fut>(
+    cache: Option<&crate::pack_cache::PackCache>,
+    pack_hash: [u8; 32],
+    fetcher: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce([u8; 32]) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    if let Some(cache) = cache {
+        if let Some(bytes) = cache.read_async(&pack_hash).await {
+            let actual = *blake3::hash(&bytes).as_bytes();
+            if actual == pack_hash {
+                tracing::debug!(
+                    "pack cache hit for {} ({} bytes)",
+                    hex_lower(&pack_hash),
+                    bytes.len()
+                );
+                return Ok(bytes);
+            }
+            tracing::warn!(
+                "pack cache returned bytes whose BLAKE3 does not match key {}; falling through to network",
+                hex_lower(&pack_hash),
+            );
+        }
+    }
+    let bytes = fetcher(pack_hash).await?;
     let actual = *blake3::hash(&bytes).as_bytes();
     if actual != pack_hash {
         bail!(
@@ -478,6 +545,11 @@ pub async fn get_pack(
             hex_lower(&actual),
             hex_lower(&pack_hash),
         );
+    }
+    // Cache the bytes we just verified. Writes are best-effort and
+    // never fail the surrounding GET.
+    if let Some(cache) = cache {
+        cache.write_async(&pack_hash, &bytes).await;
     }
     Ok(bytes)
 }
@@ -600,5 +672,97 @@ mod tests {
             dispatch_put_response(response, &our_key),
             PutDispatch::Continue,
         ));
+    }
+
+    /// Regression guard: `get_pack` MUST consult the pack cache
+    /// before doing the network GET, and a cache hit MUST NOT
+    /// invoke the network fetcher. If a future refactor drops
+    /// `cache.read_async` from `get_pack_with_fetcher`, this test
+    /// fails because the panicking fetcher will fire.
+    ///
+    /// Uses an explicit `PackCache::at(tempdir)` so the test does
+    /// not touch process-wide env vars and does not race the
+    /// pack_cache module's own env-var tests.
+    #[tokio::test]
+    async fn get_pack_short_circuits_on_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::pack_cache::PackCache::at(dir.path());
+
+        let bytes: Vec<u8> = (0..2048u32).map(|i| (i & 0xFF) as u8).collect();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        cache.write(&hash, &bytes);
+
+        let got = super::get_pack_with_fetcher(Some(&cache), hash, |_h| async move {
+            panic!("cache hit must short-circuit before fetcher fires");
+        })
+        .await
+        .expect("cache hit must succeed");
+        assert_eq!(got, bytes);
+    }
+
+    /// On a cache MISS, `get_pack_with_fetcher` must call the
+    /// network fetcher, verify content addressing, and write the
+    /// result back to the cache.
+    #[tokio::test]
+    async fn get_pack_falls_through_to_fetcher_on_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::pack_cache::PackCache::at(dir.path());
+
+        let bytes: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let bytes_for_closure = bytes.clone();
+        let got = super::get_pack_with_fetcher(Some(&cache), hash, |_h| async move {
+            Ok::<Vec<u8>, anyhow::Error>(bytes_for_closure)
+        })
+        .await
+        .expect("miss + fetcher success must return bytes");
+        assert_eq!(got, bytes);
+
+        // Post-miss: cache populated.
+        let cached = cache
+            .read(&hash)
+            .expect("cache must be populated after miss");
+        assert_eq!(cached, bytes);
+    }
+
+    /// A fetcher returning bytes whose BLAKE3 doesn't match the
+    /// requested hash MUST surface as an error (`bail!`) and MUST
+    /// NOT poison the cache. This is the host-tampering defence.
+    #[tokio::test]
+    async fn get_pack_rejects_fetcher_bytes_with_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = crate::pack_cache::PackCache::at(dir.path());
+
+        let claimed_hash = [0xCDu8; 32];
+        let err = super::get_pack_with_fetcher(Some(&cache), claimed_hash, |_h| async move {
+            // Bytes that obviously don't hash to claimed_hash.
+            Ok::<Vec<u8>, anyhow::Error>(b"wrong bytes for this hash".to_vec())
+        })
+        .await
+        .expect_err("hash mismatch must surface as error");
+        assert!(
+            err.to_string().contains("pack content hash mismatch"),
+            "error must name the mismatch: {err}"
+        );
+        // Cache must NOT be populated with the bad bytes.
+        assert!(
+            cache.read(&claimed_hash).is_none(),
+            "cache must NOT be populated when fetcher returns wrong bytes"
+        );
+    }
+
+    /// `cache: None` (cache disabled / unavailable) must always
+    /// hit the fetcher; no cache-related branching at all.
+    #[tokio::test]
+    async fn get_pack_with_no_cache_always_calls_fetcher() {
+        let bytes: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
+        let hash = *blake3::hash(&bytes).as_bytes();
+        let bytes_for_closure = bytes.clone();
+        let got = super::get_pack_with_fetcher(None, hash, |_h| async move {
+            Ok::<Vec<u8>, anyhow::Error>(bytes_for_closure)
+        })
+        .await
+        .expect("no-cache + fetcher success must return bytes");
+        assert_eq!(got, bytes);
     }
 }
