@@ -32,7 +32,7 @@
 
 use std::path::PathBuf;
 
-use freenet_git_identity::{read_bundle, BundleError};
+use freenet_git_identity::{read_bundle, BundleError, BUNDLE_VERSION};
 
 /// pubkey hex of the identity stored in the checked-in fixtures.
 /// Derived from `FIXTURE_USER_SEED = [0x42; 32]` (see
@@ -139,6 +139,63 @@ fn fixtures_have_distinct_bytes() {
 /// not visible to this integration test crate. Kept in sync by
 /// `checked_in_pubkey_matches_deterministic_seed` below.
 const FIXTURE_USER_SEED: [u8; 32] = [0x42; 32];
+
+#[test]
+fn future_version_bundle_is_rejected_at_public_api() {
+    // Take a checked-in v1 bundle, bump the `version` field in the
+    // header to BUNDLE_VERSION + 1, and confirm the public
+    // `read_bundle` API hands back a structured `UnsupportedVersion`
+    // error rather than choking on garbled ciphertext. This pins the
+    // v1/v2 dispatch contract from freenet/freenet-git#31 at the
+    // public-API boundary, complementing the in-crate
+    // `rejects_future_bundle_version_with_structured_error` unit test.
+    //
+    // Using BUNDLE_VERSION + 1 (rather than a literal 2) keeps the
+    // test self-healing: when v2 ships and BUNDLE_VERSION bumps to 2,
+    // this test bumps the fixture's version field from 1 to 3, which
+    // is still unsupported, and the dispatcher still rejects.
+    let bytes = std::fs::read(fixture_path("v1-unencrypted.bundle")).unwrap();
+    assert!(
+        bytes.len() >= 12,
+        "fixture is suspiciously short ({} bytes)",
+        bytes.len()
+    );
+
+    // bincode 1.3 default config places the 8-byte magic at [0..8] and
+    // the u32 version little-endian at [8..12]. Confirm we are about
+    // to tamper with the version field (and not some other byte).
+    let version_le = &bytes[8..12];
+    assert_eq!(
+        version_le,
+        &1u32.to_le_bytes(),
+        "v1 fixture must have version=1 at offset 8 in LE"
+    );
+
+    let future = BUNDLE_VERSION
+        .checked_add(1)
+        .expect("BUNDLE_VERSION + 1 must not overflow");
+    let mut tampered = bytes.clone();
+    tampered[8..12].copy_from_slice(&future.to_le_bytes());
+
+    // Write the tampered bytes to a temp file so we exercise
+    // `read_bundle` (the public API) rather than an internal helper.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("future-version.bundle");
+    std::fs::write(&p, &tampered).unwrap();
+
+    let err = read_bundle(&p, "")
+        .expect_err("synthetic future-version bundle must be rejected by the public API");
+    match err {
+        BundleError::UnsupportedVersion {
+            found,
+            max_supported,
+        } => {
+            assert_eq!(found, future);
+            assert_eq!(max_supported, BUNDLE_VERSION);
+        }
+        other => panic!("expected UnsupportedVersion, got {other:?}"),
+    }
+}
 
 #[test]
 fn checked_in_pubkey_matches_deterministic_seed() {
