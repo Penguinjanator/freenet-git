@@ -608,6 +608,81 @@ mod tests {
         }
     }
 
+    /// Deterministic seed bytes for the fixture user's ed25519
+    /// identity. Chosen as `[0x42; 32]` (no special meaning, just a
+    /// recognisable nibble). The corresponding verifying-key bytes
+    /// are pinned in `tests/wire_format.rs` so a regen produces a
+    /// byte-identical pubkey -- enabling anti-tamper verification
+    /// of the checked-in fixtures by re-running the generator.
+    pub const FIXTURE_USER_SEED: [u8; 32] = [0x42; 32];
+
+    /// One-shot generator for the on-disk wire-format fixtures used
+    /// by `tests/wire_format.rs`. Marked `#[ignore]` so `cargo test`
+    /// doesn't regenerate the fixtures on every run -- they are
+    /// checked-in artifacts. To regenerate (e.g. after a known,
+    /// intentional wire-format change), run:
+    ///
+    ///     cargo test -p freenet-git-identity \
+    ///         regenerate_wire_format_fixtures -- --ignored --nocapture
+    ///
+    /// Uses `FIXTURE_USER_SEED` for the ed25519 keypair so the
+    /// output is reproducible. The unencrypted fixture is fully
+    /// byte-deterministic across regen runs (the empty-passphrase
+    /// path skips both scrypt salt generation and AEAD nonce
+    /// randomness... wait, actually `seal` still calls
+    /// `KdfParams::fresh()` and a random nonce regardless of
+    /// passphrase). The encrypted fixture's outer envelope has a
+    /// fresh salt + nonce per regen, so its bytes differ each run --
+    /// content-pinning happens via the round-trip test rather than
+    /// byte equality. Anti-tamper for the unencrypted fixture is
+    /// therefore "decrypt and verify identity content matches"
+    /// rather than "byte-compare the file."
+    #[test]
+    #[ignore]
+    fn regenerate_wire_format_fixtures() {
+        use ed25519_dalek::SigningKey;
+
+        let signing = SigningKey::from_bytes(&FIXTURE_USER_SEED);
+        let bundle = DecryptedBundle {
+            secret_key: signing.to_bytes().to_vec(),
+            public_key: signing.verifying_key().to_bytes().to_vec(),
+            name: "Fixture User".into(),
+            email: "fixture@example.com".into(),
+            // `prefix` and the per-repo keys are deliberately not
+            // derived from a real per-repo keypair -- the fixture
+            // is for deserialisation testing only, never for signing
+            // or URL derivation. The literal `"fixture-prefix"`
+            // exercises the `prefix` field's serde path without
+            // committing to a particular pubkey-prefix scheme that
+            // a future Phase 1.1 change might break.
+            repos: vec![RepoRegistryEntry {
+                repo_secret: vec![0u8; 32],
+                repo_public: vec![0u8; 32],
+                prefix: "fixture-prefix".to_string(),
+                display_name: "fixture-repo".to_string(),
+            }],
+        };
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_bundle(&bundle, "test-passphrase", &dir.join("v1-encrypted.bundle")).unwrap();
+        write_bundle(&bundle, "", &dir.join("v1-unencrypted.bundle")).unwrap();
+
+        let pubkey_hex: String = bundle
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        println!();
+        println!("=== regenerated wire-format fixtures (deterministic seed) ===");
+        println!("pubkey: {}", bundle.id_string());
+        println!("pubkey hex: {pubkey_hex}");
+    }
+
     #[test]
     fn unencrypted_bundle_round_trip_through_disk_with_0600_perms() {
         let dir = tempfile::tempdir().unwrap();
