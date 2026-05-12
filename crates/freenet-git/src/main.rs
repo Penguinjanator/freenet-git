@@ -145,6 +145,30 @@ enum Cmd {
         /// Override the default 180-second per-operation timeout.
         #[arg(long, default_value = "180")]
         timeout_secs: u64,
+        /// Only rescue bundles whose `bundle-tip:<id>` extension
+        /// points at a commit that is currently in some `refs/*`
+        /// entry of the repo state.
+        ///
+        /// **Use this for snapshot-mode mirrors only.** Snapshot
+        /// mirrors force-push a fresh orphan commit on every run, so
+        /// older bundles in `object_index` are dead-weight from
+        /// rescue's perspective — no current ref points at their tip
+        /// and the network can't serve a clone from them. Skipping
+        /// them drops freenet-core's rescue from 15+ bundles to 1.
+        ///
+        /// **Do NOT use this for history-mode mirrors.** In history
+        /// mode every bundle's tip is a real commit in the parent
+        /// chain. Only the most recent push's bundle has a tip that
+        /// equals a current ref value; older bundles' tips are
+        /// ancestor commits, no longer in `refs.values()`. This flag
+        /// would incorrectly skip them and the network would lose
+        /// cache pressure on the bulk of the history.
+        ///
+        /// See freenet/freenet-git#41 for the rescue-time-budget
+        /// motivation. Default `false` keeps existing behaviour
+        /// (rescue everything).
+        #[arg(long)]
+        only_current_tips: bool,
     },
 }
 
@@ -199,7 +223,13 @@ fn run(cli: Cli) -> Result<()> {
             url,
             ws_url,
             timeout_secs,
-        } => rescue(&url, ws_url.as_deref(), Duration::from_secs(timeout_secs)),
+            only_current_tips,
+        } => rescue(
+            &url,
+            ws_url.as_deref(),
+            Duration::from_secs(timeout_secs),
+            only_current_tips,
+        ),
     }
 }
 
@@ -460,7 +490,21 @@ fn repo_id_string(pubkey: &[u8]) -> String {
 /// back, which broadcasts to whichever peers subscribe to that
 /// contract's location and bumps the bytes back to the top of their
 /// LRU cache.
-fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> {
+///
+/// When `only_current_tips` is true, bundles whose `bundle-tip:<id>`
+/// extension does NOT point at a commit currently in `state.refs.*`
+/// are skipped. Intended for snapshot-mode mirrors where each push
+/// force-replaces the branch tip with a fresh orphan commit and all
+/// previous bundles become dead-weight (no current ref points at
+/// their tip, so the network can't serve a clone from them). See the
+/// flag's docstring on `Cmd::Rescue` for the constraint on history
+/// mode.
+fn rescue(
+    url_str: &str,
+    ws_url: Option<&str>,
+    timeout: Duration,
+    only_current_tips: bool,
+) -> Result<()> {
     let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
     let ws = ws_url.unwrap_or(DEFAULT_WS_URL).to_string();
     println!("Rescuing {} via {ws}", url::format(&parsed.prefix));
@@ -514,7 +558,31 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
         let mut chunk_count = 0usize;
         let mut errors: Vec<String> = Vec::new();
 
-        for (id, record) in &state.object_index {
+        let (rescue_set, skipped_count) =
+            partition_bundles_for_rescue(&state, only_current_tips);
+
+        // Bail-with-direction guard: if --only-current-tips skipped
+        // EVERY bundle in a non-empty object_index, the contract is
+        // in a state that doesn't match the flag's assumptions
+        // (empty refs, every tip extension malformed, or — most
+        // likely — the operator passed the flag against a
+        // history-mode contract where no current ref equals any
+        // bundle tip). Exit non-zero with a directed message so CI
+        // alerts on it rather than printing "rescued 0 bundles"
+        // and returning success.
+        if only_current_tips && !state.object_index.is_empty() && rescue_set.is_empty() {
+            bail!(
+                "--only-current-tips skipped all {} bundle(s) in this contract; \
+                 no bundle's tip extension matches a current ref. \
+                 Either the contract has no refs (empty state.refs), every \
+                 tip extension is malformed, or this is a history-mode \
+                 contract where --only-current-tips is unsafe. Re-run \
+                 without --only-current-tips to rescue everything.",
+                state.object_index.len()
+            );
+        }
+
+        for (id, record) in rescue_set {
             bundle_count += 1;
             let bundle_label = format!("bundle {}", hex::encode(id));
             match &record.bundle {
@@ -540,12 +608,22 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
         }
 
         println!();
-        println!(
-            "rescued {} bundle(s), {} chunk(s); {} failure(s)",
-            bundle_count,
-            chunk_count,
-            errors.len()
-        );
+        if only_current_tips {
+            println!(
+                "rescued {} bundle(s), {} chunk(s); skipped {} dead-weight bundle(s); {} failure(s)",
+                bundle_count,
+                chunk_count,
+                skipped_count,
+                errors.len()
+            );
+        } else {
+            println!(
+                "rescued {} bundle(s), {} chunk(s); {} failure(s)",
+                bundle_count,
+                chunk_count,
+                errors.len()
+            );
+        }
         for line in &errors {
             eprintln!("{line}");
         }
@@ -558,6 +636,99 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
             ))
         }
     })
+}
+
+/// Return the subset of bundle IDs in `state.object_index` whose
+/// `bundle-tip:<id>` extension points at a commit that is currently
+/// in some `state.refs.*` entry.
+///
+/// Snapshot-mode mirrors emit one bundle per push and force-update
+/// the branch ref to that bundle's tip; old bundles still live in
+/// `object_index` but no ref points at them anymore, so this set is
+/// "current bundle(s) the network must keep serving."
+///
+/// Bundles without a tip extension (legacy pre-0.1.16 pushes) are
+/// considered unreachable here: there is no signal that any ref
+/// points at them. Safe for snapshot mode (legacy + current-but-
+/// re-pushed bundles are dead-weight); unsafe for history mode where
+/// every ancestor bundle is reachable via the commit graph but never
+/// equal to a ref value. See `Cmd::Rescue::only_current_tips`'s
+/// docstring for the mode constraint.
+/// Decide which bundles in `state.object_index` to rescue. Returns
+/// (kept, skipped_count) so the caller can iterate the kept set and
+/// print a summary line with the dropped count.
+///
+/// When `only_current_tips` is false, every bundle is kept and the
+/// skipped count is zero — the historical default.
+///
+/// When true, the kept set is restricted to bundles whose
+/// `bundle-tip:<id>` extension points at a commit currently in
+/// `state.refs.values()`. See [`reachable_bundle_ids`] for the
+/// definition and the snapshot-vs-history mode constraint.
+fn partition_bundles_for_rescue(
+    state: &freenet_git_types::RepoState,
+    only_current_tips: bool,
+) -> (
+    Vec<(
+        &freenet_git_types::ObjectBundleId,
+        &freenet_git_types::ObjectBundleRecord,
+    )>,
+    usize,
+) {
+    if !only_current_tips {
+        return (state.object_index.iter().collect(), 0);
+    }
+    let reachable = reachable_bundle_ids(state);
+    let mut kept = Vec::with_capacity(reachable.len());
+    let mut skipped = 0usize;
+    for (id, record) in &state.object_index {
+        if reachable.contains(id) {
+            kept.push((id, record));
+        } else {
+            skipped += 1;
+        }
+    }
+    (kept, skipped)
+}
+
+fn reachable_bundle_ids(
+    state: &freenet_git_types::RepoState,
+) -> std::collections::HashSet<freenet_git_types::ObjectBundleId> {
+    use freenet_git_types::signing::bundle_tip_extension_key;
+
+    let current_tips: std::collections::HashSet<&[u8]> = state
+        .refs
+        .values()
+        .map(|entry| entry.target.as_slice())
+        .collect();
+
+    state
+        .object_index
+        .keys()
+        .copied()
+        .filter(|id| {
+            let key = bundle_tip_extension_key(id);
+            let Some(ext) = state.extensions.get(&key) else {
+                return false;
+            };
+            // Tolerate cross-bundle tip aliasing (multiple bundles
+            // with the same tip extension value): both pass the
+            // filter, both get rescued. Wasted work, not wrong, and
+            // the idempotent-short-circuit on push (PR #29) prevents
+            // it in practice.
+            //
+            // Malformed extension values (length != 20) fall through
+            // `contains()` as false and the bundle is treated as
+            // unreachable. Safe degrade: a contract emitting bad
+            // tip extensions is broken at a layer above rescue;
+            // silently skipping beats panicking. The caller in
+            // `rescue()` checks for the "all bundles skipped"
+            // pathology and bails with an explicit error so an
+            // empty-refs / fully-malformed contract doesn't pass
+            // CI as success.
+            current_tips.contains(ext.value.as_slice())
+        })
+        .collect()
 }
 
 async fn rescue_pack(
@@ -763,4 +934,314 @@ fn init_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_git_types::signing::sign_bundle_tip_extension;
+    use freenet_git_types::{
+        ObjectBundle, ObjectBundleId, ObjectBundleRecord, RefEntry, RefName, RepoParams, RepoState,
+    };
+
+    fn dummy_record(seed: u8) -> ObjectBundleRecord {
+        ObjectBundleRecord {
+            bundle: ObjectBundle::SinglePack {
+                pack_hash: [seed; 32],
+                size_bytes: 0,
+            },
+            added_by: [seed; 32],
+            auth_epoch: 0,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Helper to make a RefEntry pointing at a given commit.
+    fn ref_entry(commit: [u8; 20]) -> RefEntry {
+        RefEntry {
+            target: commit,
+            update_seq: 0,
+            updater: [0u8; 32],
+            auth_epoch: 0,
+            signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn reachable_returns_only_bundles_whose_tip_is_in_refs() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        // Three bundles. Bundle A has tip == current ref. Bundles
+        // B and C have tips not in any ref (dead-weight from
+        // snapshot-mode rescue's perspective). Bundle D has no tip
+        // extension at all (legacy pre-0.1.16).
+        let id_a: ObjectBundleId = [0xAA; 32];
+        let id_b: ObjectBundleId = [0xBB; 32];
+        let id_c: ObjectBundleId = [0xCC; 32];
+        let id_d: ObjectBundleId = [0xDD; 32];
+        let tip_a = [0x01u8; 20];
+        let tip_b = [0x02u8; 20];
+        let tip_c = [0x03u8; 20];
+
+        state.object_index.insert(id_a, dummy_record(0xAA));
+        state.object_index.insert(id_b, dummy_record(0xBB));
+        state.object_index.insert(id_c, dummy_record(0xCC));
+        state.object_index.insert(id_d, dummy_record(0xDD));
+
+        let (k_a, e_a) = sign_bundle_tip_extension(&params, &key, &id_a, &tip_a, 0);
+        let (k_b, e_b) = sign_bundle_tip_extension(&params, &key, &id_b, &tip_b, 0);
+        let (k_c, e_c) = sign_bundle_tip_extension(&params, &key, &id_c, &tip_c, 0);
+        state.extensions.insert(k_a, e_a);
+        state.extensions.insert(k_b, e_b);
+        state.extensions.insert(k_c, e_c);
+        // id_d intentionally has no tip extension.
+
+        // Current ref points at tip_a only.
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(tip_a));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert_eq!(reachable.len(), 1, "only bundle A is reachable");
+        assert!(reachable.contains(&id_a));
+        assert!(
+            !reachable.contains(&id_b),
+            "B has tip ext but tip not in refs"
+        );
+        assert!(
+            !reachable.contains(&id_c),
+            "C has tip ext but tip not in refs"
+        );
+        assert!(
+            !reachable.contains(&id_d),
+            "D has no tip ext -- treated as unreachable"
+        );
+    }
+
+    #[test]
+    fn reachable_handles_multiple_refs() {
+        // Multi-branch repo: each branch's latest bundle is
+        // reachable; bundles whose tips are no branch's head are
+        // skipped.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        let id_main: ObjectBundleId = [0x11; 32];
+        let id_dev: ObjectBundleId = [0x22; 32];
+        let id_orphan: ObjectBundleId = [0x33; 32];
+        let tip_main = [0xAA; 20];
+        let tip_dev = [0xBB; 20];
+        let tip_orphan = [0xCC; 20];
+
+        state.object_index.insert(id_main, dummy_record(0x11));
+        state.object_index.insert(id_dev, dummy_record(0x22));
+        state.object_index.insert(id_orphan, dummy_record(0x33));
+
+        let (k_m, e_m) = sign_bundle_tip_extension(&params, &key, &id_main, &tip_main, 0);
+        let (k_d, e_d) = sign_bundle_tip_extension(&params, &key, &id_dev, &tip_dev, 0);
+        let (k_o, e_o) = sign_bundle_tip_extension(&params, &key, &id_orphan, &tip_orphan, 0);
+        state.extensions.insert(k_m, e_m);
+        state.extensions.insert(k_d, e_d);
+        state.extensions.insert(k_o, e_o);
+
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(tip_main));
+        state
+            .refs
+            .insert(RefName::from("refs/heads/dev"), ref_entry(tip_dev));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert_eq!(reachable.len(), 2);
+        assert!(reachable.contains(&id_main));
+        assert!(reachable.contains(&id_dev));
+        assert!(!reachable.contains(&id_orphan));
+    }
+
+    #[test]
+    fn reachable_empty_when_no_extensions_and_no_refs_match() {
+        // Pre-0.1.16 contract: bundles in object_index, no tip
+        // extensions, refs may or may not exist. Result: no bundle
+        // is considered reachable. The caller in rescue() converts
+        // this into a hard error rather than silently rescuing zero
+        // bundles — that's the bail-with-direction guard.
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.object_index.insert([0xEE; 32], dummy_record(0xEE));
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry([0xFF; 20]));
+
+        assert!(reachable_bundle_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn reachable_keeps_multiple_bundles_sharing_a_tip() {
+        // Cross-bundle tip aliasing: two bundles whose tip
+        // extensions point at the same commit. Both pass the
+        // filter. In practice the idempotent-push short-circuit
+        // from PR #29 prevents the contract from getting into this
+        // state, but the filter must tolerate it without dropping
+        // either bundle.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x33; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        let id_a: ObjectBundleId = [0x11; 32];
+        let id_b: ObjectBundleId = [0x22; 32];
+        let shared_tip = [0x88; 20];
+
+        state.object_index.insert(id_a, dummy_record(0x11));
+        state.object_index.insert(id_b, dummy_record(0x22));
+
+        let (k_a, e_a) = sign_bundle_tip_extension(&params, &key, &id_a, &shared_tip, 0);
+        let (k_b, e_b) = sign_bundle_tip_extension(&params, &key, &id_b, &shared_tip, 1);
+        state.extensions.insert(k_a, e_a);
+        state.extensions.insert(k_b, e_b);
+
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(shared_tip));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert_eq!(reachable.len(), 2, "both aliased bundles must be kept");
+        assert!(reachable.contains(&id_a));
+        assert!(reachable.contains(&id_b));
+    }
+
+    #[test]
+    fn reachable_skips_bundle_with_wrong_length_tip_value() {
+        // Malformed tip extension: a contract bug emits an extension
+        // with a `value` that isn't 20 bytes (CommitHash length).
+        // The filter must not panic and must treat the bundle as
+        // unreachable. Hand-rolled extension entry — sign_extension
+        // would have validated length downstream, but the contract
+        // itself doesn't enforce a length on extension values.
+        use freenet_git_types::{ExtensionEntry, RepoState};
+
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        let id: ObjectBundleId = [0xAA; 32];
+        state.object_index.insert(id, dummy_record(0xAA));
+
+        let bad_value = vec![0xFFu8; 32]; // 32 bytes, not 20
+        let key = freenet_git_types::signing::bundle_tip_extension_key(&id);
+        state.extensions.insert(
+            key,
+            ExtensionEntry {
+                value: bad_value,
+                update_seq: 0,
+                signature: [0u8; 64],
+            },
+        );
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry([0xFF; 20]));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert!(
+            reachable.is_empty(),
+            "malformed tip value must not match any ref"
+        );
+    }
+
+    #[test]
+    fn partition_with_filter_off_keeps_all_with_zero_skipped() {
+        // Historical default path: --only-current-tips not set.
+        // Every bundle in object_index is kept and skipped_count is 0.
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.object_index.insert([0x01; 32], dummy_record(0x01));
+        state.object_index.insert([0x02; 32], dummy_record(0x02));
+        state.object_index.insert([0x03; 32], dummy_record(0x03));
+
+        let (kept, skipped) = partition_bundles_for_rescue(&state, false);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn partition_with_filter_on_counts_skipped() {
+        // Snapshot-mode flow: three bundles, only one has a tip
+        // extension matching a current ref. Filter keeps that one,
+        // counts the other two as skipped.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        let id_keep: ObjectBundleId = [0x10; 32];
+        let id_skip_1: ObjectBundleId = [0x20; 32];
+        let id_skip_2: ObjectBundleId = [0x30; 32];
+        let tip_keep = [0xAA; 20];
+        let tip_old_1 = [0xBB; 20];
+        let tip_old_2 = [0xCC; 20];
+
+        state.object_index.insert(id_keep, dummy_record(0x10));
+        state.object_index.insert(id_skip_1, dummy_record(0x20));
+        state.object_index.insert(id_skip_2, dummy_record(0x30));
+
+        let (k1, e1) = sign_bundle_tip_extension(&params, &key, &id_keep, &tip_keep, 0);
+        let (k2, e2) = sign_bundle_tip_extension(&params, &key, &id_skip_1, &tip_old_1, 0);
+        let (k3, e3) = sign_bundle_tip_extension(&params, &key, &id_skip_2, &tip_old_2, 0);
+        state.extensions.insert(k1, e1);
+        state.extensions.insert(k2, e2);
+        state.extensions.insert(k3, e3);
+
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(tip_keep));
+
+        let (kept, skipped) = partition_bundles_for_rescue(&state, true);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(skipped, 2);
+        assert_eq!(kept[0].0, &id_keep);
+    }
+
+    #[test]
+    fn partition_with_filter_on_empty_object_index_returns_empty() {
+        // Pin: an empty contract doesn't trigger the bail-with-
+        // direction guard in rescue() (that fires only when
+        // object_index is non-empty but every bundle skipped). Pure
+        // partition output is (empty, 0).
+        let state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        let (kept, skipped) = partition_bundles_for_rescue(&state, true);
+        assert!(kept.is_empty());
+        assert_eq!(skipped, 0);
+    }
 }

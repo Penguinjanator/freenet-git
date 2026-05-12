@@ -43,10 +43,22 @@ jobs:
       # The summarize job below aggregates results.
       fail-fast: false
       matrix:
-        repo:
-          - "freenet:3GEERif5ihbf/freenet-core"
-          - "freenet:96rknpy1GYhZ/freenet-stdlib"
-          - "freenet:99TmCayXn6Tm/freenet-git"
+        # `only_current_tips: true` for snapshot-mode mirrors.
+        # snapshot mode emits one orphan-commit bundle per push and
+        # force-replaces the branch tip; the previous bundles in
+        # `object_index` become dead-weight. Skipping them drops
+        # freenet-core's rescue from 15+ bundles to 1.
+        # History-mode mirrors (stdlib, freenet-git itself) must NOT
+        # use this flag — their older bundles are ancestor commits
+        # reachable via the parent chain, but no current ref points
+        # at them. See the flag's docstring in `cli/main.rs`.
+        include:
+          - repo: "freenet:3GEERif5ihbf/freenet-core"
+            only_current_tips: true   # snapshot mode
+          - repo: "freenet:96rknpy1GYhZ/freenet-stdlib"
+            only_current_tips: false  # history mode
+          - repo: "freenet:99TmCayXn6Tm/freenet-git"
+            only_current_tips: false  # history mode (self-mirror)
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,9 +70,37 @@ jobs:
         env:
           REPO: ${{ matrix.repo }}
           WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+          ONLY_CURRENT_TIPS: ${{ matrix.only_current_tips }}
         run: |
           set -euo pipefail
-          freenet-git rescue "$REPO" --ws-url "$WS_URL"
+          # Probe the installed binary for --only-current-tips support
+          # rather than passing it unconditionally. Between this PR
+          # merging and 0.1.18 being released on crates.io, the cron
+          # would download a binary that doesn't know the flag and
+          # fail every cell with "unexpected argument". After 0.1.18
+          # ships the probe finds the flag and the snapshot-mode cells
+          # use it. Once 0.1.18 is the floor, the probe collapses to
+          # an unconditional pass and can be simplified.
+          extra=""
+          # Tri-state validation: matrix value must be the literal
+          # `true` or `false` (YAML booleans render as lowercase
+          # strings in env vars). Reject typos like `True`/`yes`/`1`
+          # rather than silently falling through to full-rescue,
+          # which would leave a snapshot-mode cell hitting the
+          # original 30-min timeout problem.
+          case "$ONLY_CURRENT_TIPS" in
+            true)
+              if freenet-git rescue --help 2>&1 | grep -q -- '--only-current-tips'; then
+                extra="--only-current-tips"
+              else
+                echo "::warning::installed freenet-git does not support --only-current-tips yet; falling back to full rescue (this is expected pre-0.1.18)"
+              fi
+              ;;
+            false) ;;
+            *) echo "::error::matrix.only_current_tips must be the literal 'true' or 'false', got '$ONLY_CURRENT_TIPS'"; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086
+          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra
 
   # Per the GH-Actions failure-notification model: matrix cell
   # failures show up in the run summary but do not (by default) email
