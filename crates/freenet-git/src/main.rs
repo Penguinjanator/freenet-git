@@ -169,6 +169,30 @@ enum Cmd {
         /// (rescue everything).
         #[arg(long)]
         only_current_tips: bool,
+        /// How many bundles to rescue in parallel. Each parallel
+        /// bundle opens its own WebSocket connection (SinglePack)
+        /// or delegates to a chunked-pack driver that opens its
+        /// own pool of up to `FREENET_GIT_PARALLEL_OPS` chunk
+        /// connections (default 8, see `chunked::parallelism_from_env`).
+        /// Peak concurrent WebSocket connections under load is
+        /// `parallel_bundles * chunk_pool`, so 2 parallel bundles
+        /// against the default chunk pool means up to 16 concurrent
+        /// PUTs to the local node.
+        ///
+        /// Default of 2 is conservative against the gateway's
+        /// per-handler scheduler — see freenet-core#4056 for what
+        /// happens when concurrent multi-PUT traffic overruns the
+        /// `wait_for_res_tx` priority (fixed in v0.2.56 via #4059,
+        /// but the ceiling is empirical not pinned). Bump cautiously
+        /// on a healthy gateway via `FREENET_GIT_RESCUE_PARALLEL`
+        /// or this flag.
+        ///
+        /// `1` returns the outer-loop work to the pre-#44 serial
+        /// shape. Full serial behaviour (including chunks) also
+        /// requires `FREENET_GIT_PARALLEL_OPS=1`. Values of `0` are
+        /// clamped up to `1`.
+        #[arg(long, env = "FREENET_GIT_RESCUE_PARALLEL", default_value = "2")]
+        parallel_bundles: usize,
     },
 }
 
@@ -224,11 +248,13 @@ fn run(cli: Cli) -> Result<()> {
             ws_url,
             timeout_secs,
             only_current_tips,
+            parallel_bundles,
         } => rescue(
             &url,
             ws_url.as_deref(),
             Duration::from_secs(timeout_secs),
             only_current_tips,
+            parallel_bundles,
         ),
     }
 }
@@ -504,7 +530,9 @@ fn rescue(
     ws_url: Option<&str>,
     timeout: Duration,
     only_current_tips: bool,
+    parallel_bundles: usize,
 ) -> Result<()> {
+    let parallel_bundles = parallel_bundles.max(1);
     let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
     let ws = ws_url.unwrap_or(DEFAULT_WS_URL).to_string();
     println!("Rescuing {} via {ws}", url::format(&parsed.prefix));
@@ -582,28 +610,82 @@ fn rescue(
             );
         }
 
-        for (id, record) in rescue_set {
-            bundle_count += 1;
-            let bundle_label = format!("bundle {}", hex::encode(id));
-            match &record.bundle {
-                freenet_git_types::ObjectBundle::SinglePack { pack_hash, .. } => {
-                    if let Err(e) = rescue_pack(&mut api, &pack_wasm, *pack_hash, timeout).await {
-                        errors.push(format!("  {bundle_label} (SinglePack): {e}"));
-                    } else {
-                        println!("ok {bundle_label} (SinglePack)");
-                    }
-                }
-                freenet_git_types::ObjectBundle::ChunkedPack {
-                    manifest_hash,
-                    total_size: _,
-                    chunk_count: declared_count,
-                } => match rescue_chunked(&ws, &pack_wasm, *manifest_hash, timeout).await {
-                    Ok(n) => {
-                        chunk_count += n;
-                        println!("ok {bundle_label} (ChunkedPack, {n}/{declared_count} chunks)",);
-                    }
-                    Err(e) => errors.push(format!("  {bundle_label} (ChunkedPack): {e}")),
+        // Drop the bootstrap connection before spawning per-bundle
+        // tasks. Each task opens its own fresh connection so the
+        // outer loop never contends with itself on a shared `&mut
+        // api`. ChunkedPack rescues additionally open their own
+        // 8-way chunk pool internally; combined concurrency at peak
+        // is roughly `parallel_bundles + parallel_bundles*8`.
+        drop(api);
+
+        // FuturesUnordered with admission control: keep at most
+        // `parallel_bundles` rescue tasks in flight; backfill as
+        // each one completes. The driver runs on a current-thread
+        // runtime (per `tokio::runtime::Builder::new_current_thread`
+        // above), so the parallelism is purely IO-overlap — the
+        // CPU work of each task is negligible compared to its
+        // network round-trips.
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::sync::Arc;
+
+        // Tasks run via `tokio::spawn` so a panic inside
+        // `rescue_one_bundle` becomes a `JoinError` rather than
+        // unwinding through `next().await` and aborting the whole
+        // rescue. We lose the label on panic (it's captured by the
+        // closure, not surfaced through JoinError), so the failure
+        // line uses a generic placeholder — but the user still gets
+        // a count and the panic message via RUST_BACKTRACE.
+        let pack_wasm = Arc::new(pack_wasm);
+        let ws = Arc::new(ws);
+        let mut iter = rescue_set.into_iter();
+        let mut in_flight: FuturesUnordered<tokio::task::JoinHandle<BundleOutcome>> =
+            FuturesUnordered::new();
+
+        loop {
+            while in_flight.len() < parallel_bundles {
+                let Some((id, record)) = iter.next() else {
+                    break;
+                };
+                let pack_wasm = pack_wasm.clone();
+                let ws = ws.clone();
+                let id_owned = *id;
+                let bundle = record.bundle.clone();
+                in_flight.push(tokio::spawn(async move {
+                    let label = format!("bundle {}", hex::encode(id_owned));
+                    rescue_one_bundle(&ws, &pack_wasm, bundle, timeout, label).await
+                }));
+            }
+            let Some(join_result) = in_flight.next().await else {
+                break;
+            };
+            let outcome = match join_result {
+                Ok(outcome) => outcome,
+                Err(join_err) if join_err.is_panic() => BundleOutcome::Err {
+                    label: "<bundle-unknown>".to_string(),
+                    kind: "panic",
+                    error: anyhow::anyhow!(
+                        "rescue task panicked: {join_err}. Re-run with RUST_BACKTRACE=1 to identify the bundle."
+                    ),
                 },
+                Err(join_err) => BundleOutcome::Err {
+                    label: "<bundle-unknown>".to_string(),
+                    kind: "cancelled",
+                    error: anyhow::anyhow!("rescue task cancelled: {join_err}"),
+                },
+            };
+            match outcome {
+                BundleOutcome::Ok {
+                    label,
+                    kind_label,
+                    chunks_rescued,
+                } => {
+                    bundle_count += 1;
+                    chunk_count += chunks_rescued;
+                    println!("ok {label} ({kind_label})");
+                }
+                BundleOutcome::Err { label, kind, error } => {
+                    errors.push(format!("  {label} ({kind}): {error}"));
+                }
             }
         }
 
@@ -729,6 +811,77 @@ fn reachable_bundle_ids(
             current_tips.contains(ext.value.as_slice())
         })
         .collect()
+}
+
+/// Outcome of a single bundle rescue, returned by `rescue_one_bundle`
+/// for the parallel driver in `rescue()` to accumulate.
+enum BundleOutcome {
+    Ok {
+        label: String,
+        kind_label: String,
+        chunks_rescued: usize,
+    },
+    Err {
+        label: String,
+        kind: &'static str,
+        error: anyhow::Error,
+    },
+}
+
+/// Drive a single bundle's GET-then-PUT cycle. Opens a fresh
+/// WebSocket connection for SinglePack rescues (the parallel driver
+/// in `rescue()` cannot share `&mut api` across bundles).
+/// ChunkedPack bundles delegate to `rescue_chunked` which manages
+/// its own connection pool internally.
+async fn rescue_one_bundle(
+    ws: &str,
+    pack_wasm: &[u8],
+    bundle: freenet_git_types::ObjectBundle,
+    timeout: Duration,
+    label: String,
+) -> BundleOutcome {
+    match bundle {
+        freenet_git_types::ObjectBundle::SinglePack { pack_hash, .. } => {
+            let mut api = match wsclient::connect(ws).await {
+                Ok(api) => api,
+                Err(e) => {
+                    return BundleOutcome::Err {
+                        label,
+                        kind: "SinglePack",
+                        error: e.context("open per-bundle WS connection"),
+                    };
+                }
+            };
+            match rescue_pack(&mut api, pack_wasm, pack_hash, timeout).await {
+                Ok(()) => BundleOutcome::Ok {
+                    label,
+                    kind_label: "SinglePack".to_string(),
+                    chunks_rescued: 0,
+                },
+                Err(e) => BundleOutcome::Err {
+                    label,
+                    kind: "SinglePack",
+                    error: e,
+                },
+            }
+        }
+        freenet_git_types::ObjectBundle::ChunkedPack {
+            manifest_hash,
+            chunk_count: declared_count,
+            ..
+        } => match rescue_chunked(ws, pack_wasm, manifest_hash, timeout).await {
+            Ok(n) => BundleOutcome::Ok {
+                label,
+                kind_label: format!("ChunkedPack, {n}/{declared_count} chunks"),
+                chunks_rescued: n,
+            },
+            Err(e) => BundleOutcome::Err {
+                label,
+                kind: "ChunkedPack",
+                error: e,
+            },
+        },
+    }
 }
 
 async fn rescue_pack(
