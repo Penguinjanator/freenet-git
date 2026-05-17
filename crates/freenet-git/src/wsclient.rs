@@ -203,6 +203,62 @@ pub fn contract_id_from_wasm_hash(wasm_hash: &[u8; 32], params_bytes: &[u8]) -> 
     ContractInstanceId::new(spec)
 }
 
+/// Prefix used in `get_state`'s timeout `bail!` messages. Shared
+/// between the bail site and [`ProbeOutcome::from_get_state_err`] so
+/// editing either site without the other breaks the build (the
+/// `format!`/`contains` calls reference the same `const`), eliminating
+/// the silent-classifier-drift class skeptical-reviewer flagged on
+/// PR #54.
+const GET_TIMEOUT_PREFIX: &str = "timed out waiting for GET response";
+
+/// Prefix used in `get_state`'s NotFound `bail!` message. Same
+/// rationale as [`GET_TIMEOUT_PREFIX`].
+const GET_NOT_FOUND_SUFFIX: &str = "not found on the network";
+
+/// Classification of one probe's outcome inside
+/// [`get_state_with_legacy_fallback`]. Captured per-probe so the final
+/// bail message can describe what actually happened instead of
+/// collapsing every failure mode into a generic "no state found"
+/// (which historically masked transient gateway timeouts as if they
+/// were permanent data loss — see 2026-05-14 freenet-stdlib mirror
+/// incident).
+#[derive(Debug)]
+enum ProbeOutcome {
+    /// Gateway returned a `GetResponse` whose state bytes were empty.
+    /// Treated as "not found" for migration purposes but distinct from
+    /// the authoritative `NotFound` reply.
+    Empty,
+    /// Gateway authoritatively answered `ContractResponse::NotFound`
+    /// for this probe's instance_id.
+    NotFound,
+    /// Per-probe `timeout` elapsed with no terminal response on the
+    /// recv loop. The most common cause of transient failures in the
+    /// field: the gateway has the contract but routing to a peer that
+    /// can satisfy the GET takes longer than the timeout.
+    Timeout,
+    /// Anything else — transport error, decode error, send failure.
+    /// Carries the underlying error message so it can be surfaced.
+    OtherError(String),
+}
+
+impl ProbeOutcome {
+    /// Classify the error from a single `get_state` call. Matches on
+    /// [`GET_TIMEOUT_PREFIX`] / [`GET_NOT_FOUND_SUFFIX`], which are the
+    /// same `const`s `get_state` uses in its `bail!` macros — so a
+    /// future edit to either bail message must update the `const` and
+    /// both sites stay in sync.
+    fn from_get_state_err(err: &anyhow::Error) -> Self {
+        let msg = err.to_string();
+        if msg.contains(GET_TIMEOUT_PREFIX) {
+            ProbeOutcome::Timeout
+        } else if msg.contains(GET_NOT_FOUND_SUFFIX) {
+            ProbeOutcome::NotFound
+        } else {
+            ProbeOutcome::OtherError(msg)
+        }
+    }
+}
+
 /// GET the repo state at `current_id`; if not found, walk
 /// `legacy_wasm_hashes`, computing the legacy contract key for the
 /// same `params_bytes` and probing each. Returns the first state we
@@ -211,6 +267,14 @@ pub fn contract_id_from_wasm_hash(wasm_hash: &[u8; 32], params_bytes: &[u8]) -> 
 ///
 /// `timeout` is per-probe, not total — a long list of legacy hashes
 /// can take O(N × timeout) in the worst case.
+///
+/// On failure, the returned error describes the dominant outcome
+/// across all probes (timeout-dominant, not-found-dominant, transport-
+/// error-dominant). This matters for operators reading rescue/mirror
+/// logs: a transient gateway slowdown that times out every probe used
+/// to bail with "no state found at current contract key or any of N
+/// legacy keys", indistinguishable from genuine data loss. The new
+/// message says "all N+1 probes timed out", which is actionable.
 pub async fn get_state_with_legacy_fallback(
     web_api: &mut WebApi,
     current_id: ContractInstanceId,
@@ -218,6 +282,10 @@ pub async fn get_state_with_legacy_fallback(
     legacy_wasm_hashes: &[&[u8; 32]],
     timeout: Duration,
 ) -> Result<LegacyAwareGet> {
+    // Probe outcomes, in (label, outcome) form. Filled as we go;
+    // formatted into the bail message if every probe fails.
+    let mut outcomes: Vec<(String, ProbeOutcome)> = Vec::new();
+
     // Fast path: try the current key first.
     match get_state(web_api, current_id, false, timeout).await {
         Ok(state) if !state.is_empty() => {
@@ -227,18 +295,19 @@ pub async fn get_state_with_legacy_fallback(
             });
         }
         Ok(_) => {
-            // Empty state: treat as "not found" for migration purposes.
+            outcomes.push((format!("current key {current_id}"), ProbeOutcome::Empty));
         }
         Err(e) => {
-            // Network error or contract not found. Don't propagate yet
-            // -- legacy probes might find data.
+            let outcome = ProbeOutcome::from_get_state_err(&e);
             tracing::debug!("current-key GET failed: {e}; trying legacy fallback");
+            outcomes.push((format!("current key {current_id}"), outcome));
         }
     }
 
     // Legacy probes.
     for (idx, legacy_hash) in legacy_wasm_hashes.iter().enumerate() {
         let legacy_id = contract_id_from_wasm_hash(legacy_hash, params_bytes);
+        let label = format!("legacy key {idx} ({legacy_id})");
         match get_state(web_api, legacy_id, false, timeout).await {
             Ok(state) if !state.is_empty() => {
                 return Ok(LegacyAwareGet {
@@ -249,17 +318,99 @@ pub async fn get_state_with_legacy_fallback(
                     },
                 });
             }
-            Ok(_) => {}
+            Ok(_) => outcomes.push((label, ProbeOutcome::Empty)),
             Err(e) => {
+                let outcome = ProbeOutcome::from_get_state_err(&e);
                 tracing::debug!("legacy probe {idx} failed: {e}");
+                outcomes.push((label, outcome));
             }
         }
     }
 
-    bail!(
-        "no state found at current contract key or any of {} legacy keys",
-        legacy_wasm_hashes.len()
-    );
+    Err(format_fallback_failure(&outcomes, timeout))
+}
+
+/// Build the final error returned when every probe in
+/// [`get_state_with_legacy_fallback`] failed. Distinguishes
+/// timeout-dominant (transient — gateway/peer routing unhealthy),
+/// not-found-dominant (likely real data loss / never published),
+/// and mixed/other-error cases.
+fn format_fallback_failure(
+    outcomes: &[(String, ProbeOutcome)],
+    timeout: Duration,
+) -> anyhow::Error {
+    let total = outcomes.len();
+    let timeouts = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, ProbeOutcome::Timeout))
+        .count();
+    let not_founds = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, ProbeOutcome::NotFound))
+        .count();
+    let empties = outcomes
+        .iter()
+        .filter(|(_, o)| matches!(o, ProbeOutcome::Empty))
+        .count();
+    let other_errors = total - timeouts - not_founds - empties;
+
+    if timeouts == total {
+        return anyhow!(
+            "GET timed out on all {total} probe(s) after {timeout:?} each \
+             (current contract key + {} legacy key(s)); gateway or peer routing \
+             may be unhealthy — operation aborted, state on the network is unknown",
+            total.saturating_sub(1)
+        );
+    }
+    if not_founds + empties == total {
+        return anyhow!(
+            "no state found at current contract key or any of {} legacy key(s) \
+             ({not_founds} authoritative NotFound, {empties} empty response)",
+            total.saturating_sub(1)
+        );
+    }
+    if other_errors == total {
+        // All probes hit transport/decode errors (e.g. WebSocket closed,
+        // every send GET fails the same way). Calling this "mixed" would
+        // contradict the dominant-outcome contract, so surface the first
+        // underlying error verbatim with a count.
+        let first = outcomes
+            .iter()
+            .find_map(|(label, outcome)| match outcome {
+                ProbeOutcome::OtherError(msg) => Some(format!("{label}: {msg}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<no detail>".to_string());
+        return anyhow!(
+            "every probe failed with transport/other error ({total} probe(s)); \
+             first failure: {first}"
+        );
+    }
+
+    // Mixed outcomes — provide the per-probe summary so the operator
+    // can see exactly what each probe returned. Caps at the first few
+    // entries to keep messages bounded if the legacy list grows.
+    let detail: Vec<String> = outcomes
+        .iter()
+        .take(8)
+        .map(|(label, outcome)| match outcome {
+            ProbeOutcome::Empty => format!("{label}: empty response"),
+            ProbeOutcome::NotFound => format!("{label}: NotFound"),
+            ProbeOutcome::Timeout => format!("{label}: timeout"),
+            ProbeOutcome::OtherError(msg) => format!("{label}: {msg}"),
+        })
+        .collect();
+    let suffix = if outcomes.len() > 8 {
+        format!(" (and {} more)", outcomes.len() - 8)
+    } else {
+        String::new()
+    };
+    anyhow!(
+        "every probe failed for repo contract — mixed outcomes \
+         ({timeouts} timeout, {not_founds} NotFound, {empties} empty, \
+         {other_errors} transport/other): {}{suffix}",
+        detail.join("; ")
+    )
 }
 
 /// Result of [`get_state_with_legacy_fallback`].
@@ -399,15 +550,15 @@ pub async fn get_state(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            bail!("timed out waiting for GET response after {timeout:?}");
+            bail!("{GET_TIMEOUT_PREFIX} after {timeout:?}");
         }
         let response = match tokio::time::timeout(remaining, web_api.recv()).await {
             Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
-            Err(_) => bail!("timed out waiting for GET response after {timeout:?}"),
+            Err(_) => bail!("{GET_TIMEOUT_PREFIX} after {timeout:?}"),
         };
         match dispatch_get_response(response, id) {
             GetDispatch::State(bytes) => return Ok(bytes),
-            GetDispatch::NotFound => bail!("contract {id} not found on the network"),
+            GetDispatch::NotFound => bail!("contract {id} {GET_NOT_FOUND_SUFFIX}"),
             GetDispatch::Continue => {}
         }
     }
@@ -1145,5 +1296,127 @@ mod tests {
         .await
         .expect("no-cache + fetcher success must return bytes");
         assert_eq!(got, bytes);
+    }
+
+    /// Pin: `ProbeOutcome::from_get_state_err` classifies the three
+    /// distinct error shapes `get_state` emits. Uses the same `const`s
+    /// `get_state` itself uses to build the bail messages, so a future
+    /// edit to either bail site MUST update the `const` (and the
+    /// classifier picks up the new prefix automatically) — closing the
+    /// silent-drift gap skeptical-reviewer flagged on PR #54.
+    #[test]
+    fn probe_outcome_classifies_get_state_errors() {
+        // Build the exact bail strings `get_state` would emit, by
+        // reusing the same `const`s. If `get_state` is later refactored
+        // to embed the const in a different surrounding string, this
+        // test still works as long as the const appears verbatim.
+        let timeout_err =
+            anyhow::anyhow!("{GET_TIMEOUT_PREFIX} after {:?}", Duration::from_secs(180));
+        let not_found_err = anyhow::anyhow!("contract 3iBuNbXTrXz... {GET_NOT_FOUND_SUFFIX}");
+        let send_err = anyhow::anyhow!("send GET: connection reset");
+
+        assert!(matches!(
+            ProbeOutcome::from_get_state_err(&timeout_err),
+            ProbeOutcome::Timeout
+        ));
+        assert!(matches!(
+            ProbeOutcome::from_get_state_err(&not_found_err),
+            ProbeOutcome::NotFound
+        ));
+        assert!(matches!(
+            ProbeOutcome::from_get_state_err(&send_err),
+            ProbeOutcome::OtherError(_)
+        ));
+    }
+
+    /// Pin: when every probe times out, the fallback failure message
+    /// must say "timed out" — not the generic "no state found" that
+    /// historically masked transient gateway slowdowns as if they were
+    /// permanent data loss (freenet-stdlib mirror demo, 2026-05-14).
+    #[test]
+    fn format_fallback_failure_all_timeouts_says_timed_out() {
+        let outcomes = vec![
+            ("current key X".to_string(), ProbeOutcome::Timeout),
+            ("legacy key 0 (Y)".to_string(), ProbeOutcome::Timeout),
+        ];
+        let err = format_fallback_failure(&outcomes, Duration::from_secs(180));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out") || msg.contains("timeout"),
+            "all-timeout message must say timed out, got: {msg}"
+        );
+        assert!(
+            !msg.starts_with("no state found"),
+            "must NOT use the misleading legacy message for timeouts, got: {msg}"
+        );
+    }
+
+    /// All-NotFound / all-empty keeps the original-style message
+    /// (genuine "not found anywhere" case).
+    #[test]
+    fn format_fallback_failure_all_not_found_says_no_state() {
+        let outcomes = vec![
+            ("current key X".to_string(), ProbeOutcome::NotFound),
+            ("legacy key 0 (Y)".to_string(), ProbeOutcome::Empty),
+        ];
+        let err = format_fallback_failure(&outcomes, Duration::from_secs(180));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no state found"),
+            "all-not-found message must say no state found, got: {msg}"
+        );
+    }
+
+    /// All-OtherError (transport/decode failures across every probe)
+    /// must be reported as a transport failure with the first underlying
+    /// error verbatim — NOT as "mixed outcomes" (Codex PR #54 P3 #2:
+    /// calling a uniform transport failure "mixed" contradicts the
+    /// dominant-outcome contract).
+    #[test]
+    fn format_fallback_failure_all_transport_errors_says_transport() {
+        let outcomes = vec![
+            (
+                "current key X".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+            (
+                "legacy key 0 (Y)".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+        ];
+        let err = format_fallback_failure(&outcomes, Duration::from_secs(180));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("transport/other error"),
+            "all-transport message must say transport, got: {msg}"
+        );
+        assert!(
+            msg.contains("connection reset"),
+            "must surface the underlying error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("mixed outcomes"),
+            "uniform transport failure must NOT be called mixed, got: {msg}"
+        );
+    }
+
+    /// Mixed outcomes get a per-probe summary so the operator can see
+    /// what each probe returned, instead of a generic message.
+    #[test]
+    fn format_fallback_failure_mixed_surfaces_per_probe_detail() {
+        let outcomes = vec![
+            ("current key X".to_string(), ProbeOutcome::Timeout),
+            ("legacy key 0 (Y)".to_string(), ProbeOutcome::NotFound),
+            (
+                "legacy key 1 (Z)".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+        ];
+        let err = format_fallback_failure(&outcomes, Duration::from_secs(180));
+        let msg = err.to_string();
+        assert!(msg.contains("mixed outcomes"), "got: {msg}");
+        assert!(msg.contains("1 timeout"), "got: {msg}");
+        assert!(msg.contains("1 NotFound"), "got: {msg}");
+        assert!(msg.contains("connection reset"), "got: {msg}");
     }
 }
