@@ -479,6 +479,12 @@ fn create_repo(
         println!(
             "  fdev publish --code {repo_wasm_path_str} --parameters {parameters_path} contract --state {state_path}",
         );
+        println!();
+        println!(
+            "Until this contract is published, `git push {git_url}` will fail: an\n\
+             update is applied on your own node before it reaches the network, so\n\
+             the node needs the contract before it can accept a push."
+        );
         return register_in_bundle(
             bundle,
             &bundle_passphrase,
@@ -511,6 +517,25 @@ fn create_repo(
         .with_context(|| format!("PUT to {ws_url}"))?;
 
     println!("PUT confirmed by host. Contract key: {}", key.id());
+    println!();
+    println!("Next steps, from inside the repo you want to publish:");
+    println!("  git remote add freenet {git_url}");
+    println!("  export FREENET_GIT_PASSPHRASE='<your passphrase>'   # unless --no-passphrase");
+    println!("  git push freenet {}", push_ref_hint(default_branch));
+    // The helper reads FREENET_GIT_WS_URL and knows nothing about the
+    // --publish-to used here, so a non-default node silently splits
+    // "where the contract lives" from "where pushes are sent". That
+    // shows up much later as a missing-contract failure on push, which
+    // is a miserable thing to debug — say it now, while the two URLs
+    // are both on screen.
+    if ws_url != DEFAULT_WS_URL {
+        println!();
+        println!("NOTE: this repo was published to {ws_url},");
+        println!("      but `git push` and `git fetch` use FREENET_GIT_WS_URL (default");
+        println!("      {DEFAULT_WS_URL}).");
+        println!("      Point them at the same node, or pushes will fail:");
+        println!("        export FREENET_GIT_WS_URL={ws_url}");
+    }
 
     register_in_bundle(
         bundle,
@@ -541,6 +566,18 @@ fn register_in_bundle(
     println!();
     println!("Registered repo in identity bundle.");
     Ok(())
+}
+
+/// Turn a fully-qualified default branch (`refs/heads/main`) into the
+/// short name a user actually types (`git push freenet main`).
+///
+/// Anything that is not a branch ref is passed through unchanged, so an
+/// unusual default ref still prints a command that means what it says
+/// rather than a mangled suffix.
+fn push_ref_hint(default_branch: &str) -> &str {
+    default_branch
+        .strip_prefix("refs/heads/")
+        .unwrap_or(default_branch)
 }
 
 fn repo_id_string(pubkey: &[u8]) -> String {
@@ -1280,6 +1317,19 @@ mod tests {
     use freenet_git_types::{
         ObjectBundle, ObjectBundleId, ObjectBundleRecord, RefEntry, RefName, RepoParams, RepoState,
     };
+
+    /// The "next steps" block printed by `create` has to be
+    /// copy-pasteable. `git push freenet refs/heads/main` works but
+    /// reads like a machine wrote it; `main` is what a user would type.
+    #[test]
+    fn push_ref_hint_shortens_branch_refs_and_passes_others_through() {
+        assert_eq!(push_ref_hint("refs/heads/main"), "main");
+        assert_eq!(push_ref_hint("refs/heads/feature/x"), "feature/x");
+        // Not a branch ref: leave it alone rather than emit a
+        // command that pushes something the user did not ask for.
+        assert_eq!(push_ref_hint("refs/tags/v1"), "refs/tags/v1");
+        assert_eq!(push_ref_hint("main"), "main");
+    }
 
     fn dummy_record(seed: u8) -> ObjectBundleRecord {
         ObjectBundleRecord {

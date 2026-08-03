@@ -356,6 +356,27 @@ async fn fetch_repo_state(
     Ok(RepoState::from_bytes(&state)?)
 }
 
+/// Render the repos an identity bundle can sign pushes for, for use in
+/// the "wrong identity" error.
+///
+/// Listing them turns "you don't own this" into something the user can
+/// act on: nearly always they either mistyped the prefix in
+/// `git remote add` or are pointed at the wrong bundle, and seeing the
+/// prefixes side by side tells them which. Kept as a pure function over
+/// the registry so the empty-bundle wording is unit-testable.
+fn describe_pushable_repos(bundle: &DecryptedBundle) -> String {
+    if bundle.repos.is_empty() {
+        return "This identity has not created any repos, so there is nothing it \
+                can push to yet."
+            .to_string();
+    }
+    let mut out = String::from("Repos this identity can push to:");
+    for repo in &bundle.repos {
+        out.push_str(&format!("\n  {} ({})", repo.prefix, repo.display_name));
+    }
+    out
+}
+
 fn handle_list<W: Write>(env: &HelperEnv, out: &mut W) -> Result<()> {
     let runtime = build_runtime()?;
     let repo_wasm = load_repo_wasm(env)?;
@@ -827,9 +848,16 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         .find(|r| r.prefix == env.prefix)
         .ok_or_else(|| {
             anyhow!(
-                "no entry for prefix {} in identity bundle registry — was this \
-                 repo created with this identity?",
+                "this identity cannot sign pushes to {}: no entry for that prefix \
+                 in the identity bundle at {}.\n\n{}\n\n\
+                 If you created the repo with a different identity, point \
+                 FREENET_GIT_IDENTITY at that bundle. If you have not created it \
+                 yet, `freenet-git create --name <name>` makes a repo you own \
+                 (you cannot push to someone else's repo — publish your own \
+                 clone and send them the URL instead).",
                 env.prefix,
+                env.identity_path.display(),
+                describe_pushable_repos(&bundle),
             )
         })?;
     let signing = {
@@ -1083,10 +1111,18 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         let _ = merged;
 
         // UPDATE the repo contract with the signed delta.
+        //
+        // `update_state` derives the contract key's code hash from
+        // `repo_wasm`, and that is load-bearing rather than cosmetic:
+        // freenet-core resolves the contract for a delta update by
+        // probing on the key's code hash, so a placeholder there fails
+        // every push with `missing contract`. See
+        // `wsclient::update_contract_key`.
         eprintln!("==> updating repo state on Freenet");
         wsclient::update_state(
             &mut api,
             env.contract_id,
+            &repo_wasm,
             bincode::serialize(&delta)?,
             ws_timeout(),
         )
@@ -1355,6 +1391,45 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity_bundle(repos: &[(&str, &str)]) -> DecryptedBundle {
+        DecryptedBundle {
+            secret_key: vec![0u8; 32],
+            public_key: vec![0u8; 32],
+            name: "Test".into(),
+            email: "test@example.com".into(),
+            repos: repos
+                .iter()
+                .map(|(prefix, display_name)| identity::RepoRegistryEntry {
+                    repo_secret: vec![0u8; 32],
+                    repo_public: vec![0u8; 32],
+                    prefix: (*prefix).to_string(),
+                    display_name: (*display_name).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The "wrong identity" error lists what this bundle CAN push to,
+    /// because the usual cause is a mistyped prefix or the wrong
+    /// bundle — both obvious once the prefixes are shown side by side.
+    #[test]
+    fn describe_pushable_repos_lists_prefix_and_name() {
+        let bundle = identity_bundle(&[("RtTzy58hMxAB", "my-project"), ("Aa12bc34De56", "other")]);
+        let rendered = describe_pushable_repos(&bundle);
+        assert!(rendered.contains("RtTzy58hMxAB (my-project)"), "{rendered}");
+        assert!(rendered.contains("Aa12bc34De56 (other)"), "{rendered}");
+    }
+
+    /// An empty registry must not print an empty list under a
+    /// "Repos this identity can push to:" heading — that reads like a
+    /// rendering bug. Say plainly that there are none.
+    #[test]
+    fn describe_pushable_repos_handles_empty_registry() {
+        let rendered = describe_pushable_repos(&identity_bundle(&[]));
+        assert!(rendered.contains("has not created any repos"), "{rendered}");
+        assert!(!rendered.contains("can push to:"), "{rendered}");
+    }
 
     fn fake_bundle(pack_hash: [u8; 32]) -> ObjectBundle {
         ObjectBundle::SinglePack {

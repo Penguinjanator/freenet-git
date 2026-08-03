@@ -15,8 +15,8 @@ use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
 use freenet_stdlib::prelude::{
-    ContractCode, ContractContainer, ContractInstanceId, ContractKey, ContractWasmAPIVersion,
-    Parameters, RelatedContracts, WrappedContract, WrappedState,
+    CodeHash, ContractCode, ContractContainer, ContractInstanceId, ContractKey,
+    ContractWasmAPIVersion, Parameters, RelatedContracts, WrappedContract, WrappedState,
 };
 use tokio_tungstenite::connect_async;
 
@@ -327,6 +327,46 @@ fn is_transient_host_error(msg: &str) -> bool {
         || m.contains("try again later")
         || m.contains("timed out")
         || m.contains("timeout")
+}
+
+/// Substring freenet-core uses when a node cannot resolve, in its **own
+/// local store**, the contract an operation targets. Two distinct core
+/// errors carry it:
+///
+/// * `missing contract: {id}` — the node could not resolve the contract
+///   to apply an update against. Through 0.1.24 this was self-inflicted:
+///   we sent a placeholder code hash that freenet-core's code-hash-keyed
+///   probe could never match, so every push failed here. See
+///   [`update_contract_key`].
+/// * `missing contract parameters` — state is present but the code /
+///   params are not, so the node cannot run the contract's merge.
+///
+/// Either way it is a *local* condition, not a network one. The host's
+/// own wording ("error while executing operation in the network") says
+/// the opposite, which is why [`update_recv_error`] rewrites it.
+///
+/// Deliberately does **not** match freenet-core's
+/// `missing related contract: {id}`, which means a *dependency*
+/// contract is absent, a different problem with a different fix. The
+/// substring below does not occur in that message (it reads "missing
+/// related contract"), so no explicit exclusion is needed;
+/// [`missing_contract_marker_does_not_match_missing_related_contract`]
+/// pins that.
+///
+/// This is substring matching on another project's error prose, so it
+/// can rot if freenet-core rewords. The failure mode is benign: we stop
+/// recognising the condition and pass the host's raw error through
+/// unrewritten. Degraded, never wrong.
+const MISSING_CONTRACT_MARKER: &str = "missing contract";
+
+/// True when a host error message means "this node could not resolve
+/// the contract locally". See [`MISSING_CONTRACT_MARKER`].
+///
+/// A free function over `&str` rather than logic inlined in
+/// [`update_recv_error`] so the classification is unit-testable against
+/// raw host strings, mirroring [`is_transient_host_error`].
+fn is_missing_contract_message(msg: &str) -> bool {
+    msg.contains(MISSING_CONTRACT_MARKER)
 }
 
 /// True if the probe sequence is worth retrying: at least one outcome
@@ -823,19 +863,21 @@ fn dispatch_update_response(response: HostResponse, id: ContractInstanceId) -> U
 /// authoritatively answers `ContractResponse::NotFound` for `id` —
 /// symmetric with [`get_state`] so the push path doesn't deadlock when
 /// the gateway's task-per-tx UPDATE driver exhausts its retries.
+///
+/// `wasm_bytes` is the contract's WASM, used only to derive the code
+/// hash the request must carry. It is not sent. Passing the wrong bytes
+/// makes the node fail to resolve the contract; see
+/// [`update_contract_key`] for why that matters and what it used to
+/// cost.
 pub async fn update_state(
     web_api: &mut WebApi,
     id: ContractInstanceId,
+    wasm_bytes: &[u8],
     delta_bytes: Vec<u8>,
     timeout: Duration,
 ) -> Result<()> {
-    use freenet_stdlib::prelude::{CodeHash, StateDelta, UpdateData};
-    // Update needs a full ContractKey (instance id + code hash). We don't
-    // know the code hash from the instance id alone, but the host does
-    // not actually re-derive it from the request — it uses the key only
-    // for routing. A zero CodeHash works as a placeholder; downstream
-    // matching is by `ContractKey::id()` only.
-    let key = ContractKey::from_id_and_code(id, CodeHash::new([0u8; 32]));
+    use freenet_stdlib::prelude::{StateDelta, UpdateData};
+    let key = update_contract_key(id, wasm_bytes);
     let req = ContractRequest::Update {
         key,
         data: UpdateData::Delta(StateDelta::from(delta_bytes)),
@@ -852,16 +894,77 @@ pub async fn update_state(
             bail!("timed out waiting for UPDATE response after {timeout:?}");
         }
         let response = match tokio::time::timeout(remaining, web_api.recv()).await {
-            Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
+            Ok(r) => r.map_err(|e| update_recv_error(id, &e.to_string()))?,
             Err(_) => bail!("timed out waiting for UPDATE response after {timeout:?}"),
         };
         match dispatch_update_response(response, id) {
             UpdateDispatch::Success => return Ok(()),
             UpdateDispatch::NotFound => {
-                bail!("contract {id} not found on the network (cannot UPDATE)")
+                bail!(
+                    "contract {id} not found on the network (cannot UPDATE). The \
+                     repo state was readable a moment ago, so this is usually \
+                     transient routing rather than lost data — retry the push, \
+                     and if it persists run `freenet-git rescue <repo-url>`."
+                )
             }
             UpdateDispatch::Continue => {}
         }
+    }
+}
+
+/// Build the [`ContractKey`] an UPDATE request must carry: the target
+/// instance id plus the **real** code hash of the contract's WASM.
+///
+/// The code hash is load-bearing, not decoration. freenet-core resolves
+/// the contract for an incoming update with
+/// `runtime.code_blob_stored(key.code_hash())`, a probe keyed by code
+/// hash rather than instance id (freenet-core#4218). A delta update
+/// carries no code of its own, so if that probe misses, the node has
+/// nothing to run the merge with and fails the update outright with
+/// `missing contract: {id}` — even when it is holding the contract,
+/// serving reads for it, and subscribed to it.
+///
+/// Until 0.1.25 this passed `CodeHash::new([0u8; 32])` as a
+/// placeholder, on the documented assumption that the host used the key
+/// only for routing and matched on `ContractKey::id()` alone. That
+/// assumption is false against a code-hash-keyed probe: a zero hash
+/// misses unconditionally, so *every* push failed with a
+/// `missing contract` error that pointed at the network while the cause
+/// was in the request. Deriving the hash costs one BLAKE3 over bytes we
+/// already hold ([`CodeHash::from_code`] is the same derivation
+/// [`put_contract`] uses via `ContractKey::from_params_and_code`), so
+/// there is no reason to send a placeholder.
+fn update_contract_key(id: ContractInstanceId, wasm_bytes: &[u8]) -> ContractKey {
+    ContractKey::from_id_and_code(id, CodeHash::from_code(wasm_bytes))
+}
+
+/// Turn the host's error text for an UPDATE into the error we surface.
+///
+/// The one case worth rewriting is the local-resolution failure. The raw
+/// text reads `client error: error while executing operation in the
+/// network: UPDATE failed: missing contract: <id>`, which points at the
+/// network when the condition is entirely local, and cost at least one
+/// user a debugging session chasing connectivity that was fine. The
+/// rewrite names the local node and keeps the host's own text appended,
+/// so nothing is lost for anyone reading further.
+///
+/// Everything else passes through verbatim under the historical `recv:`
+/// prefix, because for failures we cannot classify the host's wording is
+/// the most informative thing available.
+fn update_recv_error(id: ContractInstanceId, host_message: &str) -> anyhow::Error {
+    if is_missing_contract_message(host_message) {
+        anyhow!(
+            "the local Freenet node could not resolve contract {id} to apply \
+             the update to. An update is applied on your own node before it is \
+             sent to the network, so this is a local condition despite what \
+             the host's wording suggests. Check that you are pushing through \
+             the node the repo was published to (`git push` uses \
+             FREENET_GIT_WS_URL, `freenet-git create` uses --publish-to), and \
+             that it is running and past startup. \
+             (host said: {host_message})"
+        )
+    } else {
+        anyhow!("recv: {host_message}")
     }
 }
 
@@ -1639,6 +1742,145 @@ mod tests {
         assert!(!is_transient_host_error(
             "decode error: invalid state bytes"
         ));
+    }
+
+    /// Regression test for the 0.1.24 push failure: an UPDATE must
+    /// carry the SAME code hash a PUT of the same WASM would compute.
+    ///
+    /// freenet-core resolves the contract for an incoming delta update
+    /// by probing on `key.code_hash()`, so a key whose code hash does
+    /// not match what was stored can never resolve. Asserting equality
+    /// against the PUT-side key is the real invariant: the two requests
+    /// have to name the same blob. The explicit zero check pins the
+    /// specific placeholder that caused the bug, so a future
+    /// "simplification" back to a placeholder fails here rather than in
+    /// the field.
+    #[test]
+    fn update_key_carries_the_same_code_hash_a_put_would() {
+        // Any bytes work — the derivation under test is BLAKE3 over
+        // them, not WASM validation.
+        let wasm = b"\x00asm-pretend-this-is-the-repo-contract";
+        let params = Parameters::from(b"prefix-params".to_vec());
+        let put_key = ContractKey::from_params_and_code(params, ContractCode::from(wasm.to_vec()));
+
+        let update_key = update_contract_key(*put_key.id(), wasm);
+
+        assert_eq!(
+            update_key.id(),
+            put_key.id(),
+            "UPDATE must target the same contract instance"
+        );
+        assert_eq!(
+            update_key.code_hash(),
+            put_key.code_hash(),
+            "UPDATE's code hash must match the PUT's, or freenet-core's \
+             code-hash-keyed probe cannot resolve the contract"
+        );
+        assert_ne!(
+            *update_key.code_hash(),
+            CodeHash::new([0u8; 32]),
+            "the zero placeholder is what made every push fail with \
+             `missing contract` in 0.1.24; do not reintroduce it"
+        );
+    }
+
+    /// Different WASM must produce a different code hash, so the test
+    /// above cannot pass by accident (e.g. if the derivation were
+    /// stubbed to a constant).
+    #[test]
+    fn update_key_code_hash_depends_on_the_wasm_bytes() {
+        let id = *test_key(3).id();
+        assert_ne!(
+            update_contract_key(id, b"contract-a").code_hash(),
+            update_contract_key(id, b"contract-b").code_hash(),
+        );
+    }
+
+    /// Verbatim from a user report on Matrix (2026-08-03): a push that
+    /// failed because the pushing node had never held the repo
+    /// contract. This exact string is what the classifier has to
+    /// recognise for the push path's self-heal to fire.
+    #[test]
+    fn is_missing_contract_message_recognizes_reported_push_failure() {
+        assert!(is_missing_contract_message(
+            "recv: client error: error while executing operation in the network: \
+             UPDATE failed: missing contract: 3GEERif5ihbfLpaVFPPRw2LWbmVZAn7iKKR1cKh4ymzQ"
+        ));
+    }
+
+    /// The sibling core error: state is present but code/params are
+    /// not. Same remedy (re-PUT the contract), so it must classify the
+    /// same way.
+    #[test]
+    fn is_missing_contract_message_recognizes_missing_parameters() {
+        assert!(is_missing_contract_message(
+            "recv: client error: error while executing operation in the network: \
+             UPDATE failed: missing contract parameters"
+        ));
+    }
+
+    /// freenet-core's `missing related contract: {id}` means a
+    /// *dependency* contract is absent. Re-PUTting the repo contract
+    /// would not fix that, so misclassifying it would send the push
+    /// path into a pointless PUT and mask the real cause. This pins the
+    /// claim made in [`MISSING_CONTRACT_MARKER`]'s docs that no
+    /// explicit exclusion is required.
+    #[test]
+    fn missing_contract_marker_does_not_match_missing_related_contract() {
+        assert!(!is_missing_contract_message(
+            "recv: client error: error while executing operation in the network: \
+             missing related contract: 3GEERif5ihbfLpaVFPPRw2LWbmVZAn7iKKR1cKh4ymzQ"
+        ));
+    }
+
+    /// Unrelated failures must not be classified as missing-contract:
+    /// a spurious re-PUT of the whole contract on every timeout would
+    /// be both slow and misleading.
+    #[test]
+    fn is_missing_contract_message_rejects_unrelated_failures() {
+        assert!(!is_missing_contract_message(
+            "contract 3iBuNbXTrXz... not found on the network (cannot UPDATE)"
+        ));
+        assert!(!is_missing_contract_message(
+            "recv: client error: error while executing operation in the network: \
+             contract queue full, try again later"
+        ));
+        assert!(!is_missing_contract_message(
+            "timed out waiting for UPDATE response after 180s"
+        ));
+    }
+
+    /// The missing-contract error must say "local … node", because the
+    /// host's own wording ("error … in the network") points users at
+    /// the network when the problem is on their own machine. The raw
+    /// host text is still appended so nothing is lost.
+    #[test]
+    fn update_recv_error_names_the_local_node_for_missing_contract() {
+        let id = *test_key(7).id();
+        let host = "client error: error while executing operation in the network: \
+                    UPDATE failed: missing contract: 3GEERif5ihbf";
+        let err = update_recv_error(id, host);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("local Freenet node"),
+            "missing-contract error should point at the local node, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(host),
+            "missing-contract error should still carry the host's own text, got: {rendered}"
+        );
+        assert!(is_missing_contract_message(&rendered));
+    }
+
+    /// Unrecognised host errors keep the historical `recv:` prefix and
+    /// are passed through verbatim — the host's wording is the best
+    /// information available for failures we cannot classify.
+    #[test]
+    fn update_recv_error_passes_through_unrecognised_failures() {
+        let id = *test_key(8).id();
+        let err = update_recv_error(id, "connection closed by peer");
+        assert_eq!(err.to_string(), "recv: connection closed by peer");
+        assert!(!is_missing_contract_message(&err.to_string()));
     }
 
     /// `outcomes_worth_retrying` gates the probe retry. The 2026-06-16

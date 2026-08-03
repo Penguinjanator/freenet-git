@@ -96,6 +96,13 @@ export FREENET_GIT_PASSPHRASE='your-passphrase'
 git push freenet main
 ```
 
+`freenet-git create` is the step that actually publishes the repo
+contract, and it prints `PUT confirmed by host` when that lands.
+`git remote add` publishes nothing on its own, so it is not a
+substitute. If you publish to a non-default node with `--publish-to`,
+set `FREENET_GIT_WS_URL` to that same node before pushing: `git push`
+reads that variable and knows nothing about `--publish-to`.
+
 ### Passphrase handling
 
 `git push` and `git fetch` go through `git-remote-freenet`, which
@@ -316,9 +323,67 @@ the contract. Schedule mirror crons aggressively without worrying
 about contract churn -- they only do work when the source
 actually moved.
 
-A future release will add `freenet-git rescue --from <git-dir>`
-so any clone-holder can rescue from their working tree even if
-the local node's cache has also forgotten.
+If the local node's cache has forgotten the bytes too, rescue can
+rebuild them from a clone instead of fetching them:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --from ~/code/my-project/.git
+```
+
+Pack output is deterministic for a given object set and git version,
+so the rebuilt pack is byte-for-byte the one the contract references.
+This covers history-mode mirrors with `SinglePack` bundles; snapshot
+mirrors and chunked bundles still use the fetch-only path, because
+their reconstruction shape is not recoverable from the contract
+metadata today.
+
+## Troubleshooting
+
+### `UPDATE failed: missing contract` when pushing
+
+```text
+error: ... UPDATE failed: missing contract: <id>
+```
+
+**If you are on 0.1.24 or earlier, upgrade.** Every push failed this
+way. freenet-git sent a placeholder value where the update request
+carries the contract's code hash, and recent Freenet nodes look the
+contract up by exactly that hash, so the lookup could never match. The
+message named the network, but nothing was wrong with the network, the
+node, or the repo. `cargo install freenet-git` picks up the fix.
+
+On 0.1.25+ this means the node genuinely could not resolve the contract
+to apply your update to. It is still a local condition despite the
+host's wording: an update is applied on your own node before it is sent
+to the network. Check:
+
+* **Are you pushing through the node the repo was published to?**
+  `git push` uses `FREENET_GIT_WS_URL` (default
+  `ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`),
+  while `freenet-git create` uses `--publish-to`. If those differ,
+  point them at the same node.
+* **Is that node running and past startup?**
+* **Was the repo ever published?** `freenet-git create` prints
+  `PUT confirmed by host` when it lands. With `--no-publish` nothing
+  was published, and you need the `fdev publish` command that `create`
+  printed for you.
+
+### `this identity cannot sign pushes to <prefix>`
+
+Every repo has its own keypair, held in the identity bundle that
+created it. The error lists the repos the current bundle can push to.
+Either point `FREENET_GIT_IDENTITY` at the bundle that owns the repo,
+or, if you are trying to contribute to someone else's repo, publish
+your own clone and send them the URL (see "Sending changes to a
+maintainer"). There is no shared-write mode yet; that is Phase 1.1.
+
+### `exhausted all peers` during clone or fetch
+
+The contract is published but its pack bytes have fallen out of the
+network's caches. Ask whoever publishes it to run `freenet-git rescue`
+(see "Keeping a published repo alive"). Repos with no one running
+rescue will eventually become unclonable; that is the current
+durability model, not a bug.
 
 ## How URLs work
 
@@ -412,7 +477,9 @@ Working today:
 - fetch and clone through Git's remote-helper protocol
 - clone live demo repos from the public Freenet network
 - `freenet-git rescue <url>` to re-PUT a repo's bundles when chunks
-  evict from the wider network (cures `exhausted all peers` errors)
+  evict from the wider network (cures `exhausted all peers` errors),
+  with `--from <git-dir>` to rebuild packs the local node has also
+  forgotten
 
 Not yet supported:
 
