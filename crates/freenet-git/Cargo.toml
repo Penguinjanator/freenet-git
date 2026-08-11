@@ -61,7 +61,14 @@ hex = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[build-dependencies]
+freenet-migrate-build = { workspace = true }
+
 [dev-dependencies]
+# The registry/guard tests exercise the same build-side machinery build.rs
+# runs (parse + validate + hash-guard), so registry mistakes fail a test run
+# as well as the build.
+freenet-migrate-build = { workspace = true }
 tempfile = "3.10"
 assert_cmd = "2"
 predicates = "3"
